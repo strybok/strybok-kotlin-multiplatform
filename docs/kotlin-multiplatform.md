@@ -35,12 +35,12 @@ kotlin {
     listOf(iosArm64(), iosSimulatorArm64()).forEach { target ->
         target.binaries.framework {
             baseName = "Shared"
-            export("com.strybok:strybok-kmp:0.2.0")
+            export("com.strybok:strybok-kmp:0.3.0")
         }
     }
     sourceSets {
         commonMain.dependencies {
-            api("com.strybok:strybok-kmp:0.2.0")
+            api("com.strybok:strybok-kmp:0.3.0")
         }
     }
 }
@@ -240,10 +240,13 @@ Task { try? await strybok.start() }
 
 Options (Kotlin named arguments): `timeout` (5 s per attempt), `maxRetries` (2; only timeouts,
 network errors and 5xx are retried), `retryDelay` (400 ms, doubles per retry), `dedupeWindow`
-(2 s), `reportAppOpens` (`true`), `onError`, `clientKey` (only for `createLink`), plus
-`linkSource`, `transport` and `coroutineContext` for tests and custom setups. Swift sees two short
-constructors with all defaults, `Strybok(apiBaseUrl:allowedHosts:onError:)` and
-`Strybok(apiBaseUrl:allowedHosts:clientKey:onError:)`; configure anything else in Kotlin.
+(2 s), `reportAppOpens` (`true`), `onError`, `clientKey` (only for `createLink`), `attestation`
+and `integrityTokenProvider` (only for `createLink`, see
+[Extra protection](#extra-protection)), plus `linkSource`, `transport` and `coroutineContext` for
+tests and custom setups. Swift sees three short constructors with all defaults,
+`Strybok(apiBaseUrl:allowedHosts:onError:)`, `Strybok(apiBaseUrl:allowedHosts:clientKey:onError:)`
+and `Strybok(apiBaseUrl:allowedHosts:clientKey:attestation:onError:)`; configure anything else in
+Kotlin.
 
 Things to know:
 
@@ -425,6 +428,147 @@ Things to know:
 - In tests, answer the `POST …/v1/public/links` request in your `transport` with
   `HttpResponse(201, """{"linkId":"l1","url":"https://my-app.strybok.link/abc","slug":"abc","routePath":"/product/42"}""")`.
 
+### Extra protection
+
+The publishable key can be copied out of your app, so anyone can create links for the routes you
+allowed. If that matters to you, the owner of the application can ask Strybok to accept link
+requests only — or preferably — from a **genuine build of your app on a genuine device**. The
+proof is Apple **App Attest** on iOS and Google **Play Integrity** on Android; the JVM target
+cannot attest. What this does and does not protect, and the dashboard side, are described in
+[Keeping link creation from your app safe](./link-creation-security.md); read
+[its limits](./link-creation-security.md#the-limits) before you rely on it.
+
+It is off by default. The SDK does not depend on Google's libraries: an Android app for a market
+without Google Play uses the same artifact and passes no token provider.
+
+**Dashboard.** Open your application → **Setup** → **Links from the app** → **Extra protection
+(optional)** and choose the mode: **Preferred** first; **Required** only after you have seen
+your released apps pass. You can set up one platform only — with **Required**, apps on the other
+platform then cannot create links at all.
+
+**iOS (App Attest)**
+
+1. In the dashboard, the application needs your **Apple Team ID** and **bundle ID** (the ones
+   used for Universal Links).
+2. In Xcode, select the iOS app target → **Signing & Capabilities** → **+ Capability** → **App
+   Attest**. This adds the `com.apple.developer.devicecheck.appattest-environment` entitlement
+   (`development` for builds run from Xcode, always `production` for TestFlight and the App
+   Store).
+3. While developing, tick **Accept development builds (iOS)** in the dashboard. Untick it before
+   you rely on the protection.
+4. Test on a **real device**: App Attest does not exist in the simulator.
+
+Nothing else is needed in the app: no dependency, no key to configure. The SDK keeps the
+identifier of the device's App Attest key (not a secret) in the app's own storage, under
+`Library/Application Support/com.strybok.sdk/attestation`, excluded from backups.
+
+**Android (Play Integrity)**
+
+1. Dashboard: fill in the **package name** and the **SHA-256 fingerprints of your signing
+   certificates** (with Play App Signing, the _app signing key_ certificate from Play Console →
+   **Test and release** → **App integrity**, not your upload key).
+2. [Google Cloud console](https://console.cloud.google.com/): choose or create a project and
+   enable the **Google Play Integrity API**. Note the **project number** (a number, not the
+   project id).
+3. [Play Console](https://play.google.com/console/): your app → **Test and release** → **App
+   integrity** → **Play Integrity API** → **link that Cloud project**.
+4. Cloud console → **IAM & Admin** → **Service Accounts**: create a service account only for
+   this purpose, with only the roles Google's Play Integrity documentation asks for, and create
+   a **JSON key** for it.
+5. Dashboard → **Android — Play Integrity** → **Upload Google key**, then delete the downloaded
+   file.
+6. Add Google's library to the Android source set yourself; the SDK does not pull it in:
+
+```kotlin
+kotlin {
+    sourceSets {
+        androidMain.dependencies {
+            implementation("com.google.android.play:integrity:1.4.0") // or newer
+        }
+    }
+}
+```
+
+7. Test with a build **installed from Google Play** (an internal testing track is enough). A
+   build installed from Android Studio is not "recognised by Play" and is refused.
+
+**Switch it on.** `attestation = true` is all iOS needs. Android additionally needs a token
+provider, which is created in Android code because it needs a `Context`:
+
+```kotlin
+// commonMain
+fun createStrybok(integrityTokenProvider: IntegrityTokenProvider? = null) = Strybok(
+    apiBaseUrl = "https://api.strybok.com",
+    allowedHosts = setOf("my-app.strybok.link"),
+    clientKey = "pk_…",
+    attestation = true,
+    integrityTokenProvider = integrityTokenProvider, // Android only; ignored elsewhere
+)
+
+// androidMain, e.g. in Application.onCreate
+val strybok = createStrybok(
+    PlayIntegrityTokenProvider(
+        context = applicationContext,
+        cloudProjectNumber = 123456789012L, // the Cloud project number from step 2
+    ),
+)
+
+// iosMain (or Swift: Strybok(apiBaseUrl:allowedHosts:clientKey:attestation:onError:))
+val strybok = createStrybok()
+```
+
+`createLink` is called exactly as before. The first call — and about one call an hour after
+that — first asks the service for a one-time challenge, asks the platform for a proof bound to
+it and exchanges that for a session token, which is kept in memory only. Nothing of this happens
+in `start()` or when a link arrives, and never ahead of time: an app that never calls
+`createLink` makes no attestation request and creates no App Attest key.
+
+Two more errors can come out of `createLink`:
+
+| Error                                 | Meaning                                                                                                                                                                                                                                                     | Retrying helps |
+| ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------- |
+| `StrybokAttestationRequiredException` | The mode is **Required** and this request carried no proof: the device or build cannot attest (see the limits), or `attestation` is off. Expected on such devices — tell the user that sharing is not available here rather than show an error.             | no             |
+| `StrybokAttestationFailedException`   | The service refused the session token, the SDK attested again, and the fresh token was refused too. `reason` is `invalid`, `expired` or `exhausted` when the service gave one. Should not happen in a correctly set-up release; check the dashboard set-up. | no             |
+
+**When a device cannot attest** — a simulator, no Google Play services, no token provider,
+Apple or Google not reachable, an incomplete dashboard set-up — the SDK does not fail on its
+own. It sends the request without a proof and reports what the service answers: the link (mode
+**Off**, or **Preferred** within the small shared allowance), `StrybokRateLimitedException`
+(that allowance is used up) or `StrybokAttestationRequiredException` (mode **Required**). It
+then waits 60 seconds before it tries to attest again. Attestation never affects receiving links
+and never throws anything but the `StrybokException`s of `createLink`.
+
+**Android without Google Play.** `IntegrityTokenProvider` is a small interface (given the
+request hash, return a Play Integrity token or `null`). `PlayIntegrityTokenProvider` is the
+ready-made implementation; it only works when the app itself adds
+`com.google.android.play:integrity`, and reports "cannot attest" (with one warning in logcat)
+when the library is missing. For a flavour that must not contain Google libraries, leave the
+dependency out and pass no provider: nothing of Google is referenced or downloaded. An app that
+already uses Play Integrity can implement the interface on top of its own code instead; the
+request must be a **standard** request with the given `requestHash`.
+
+**The limits, plainly:**
+
+- **iOS: App Attest needs iOS 14 or later and a real device.** It does not work in the
+  simulator and can be unavailable in app extensions and on some Macs running iOS apps.
+- **Android: it needs Google Play services, the Play Store and a build installed from Google
+  Play.** It does not work on devices without Google services — most devices sold in mainland
+  China, Huawei devices without Google Mobile Services — or for sideloaded builds and builds
+  from other stores.
+- With mode **Required**, every user on such a device or build cannot create links at all.
+- **Google limits how often you can ask**: 10,000 integrity requests a day per app by default; a
+  higher tier has to be requested from Google. The SDK asks about once an hour per running app
+  (more often when a token is used up after 30 new links).
+- On Android, Strybok needs a **Google service-account key** of yours to read the verdicts.
+- It raises the cost of abuse; it does not stop a real user of the real app, and a proof can be
+  taken from a device an attacker controls.
+- **This code has never run against Apple's or Google's real services or on a physical
+  device.** The flow is covered by unit tests on the JVM, Android host and the iOS simulator
+  with a fake App Attest service, a fake token provider and a fake Strybok service. The thin
+  wrappers around `DCAppAttestService` and Google's library compile, and are otherwise
+  unverified (the simulator only confirms that App Attest reports "not supported" there). Treat
+  **Required** as experimental until you have seen your own released builds pass.
+
 ## Troubleshooting
 
 | Symptom                                                                       | Check                                                                                                                                                                                                                   |
@@ -434,7 +578,7 @@ Things to know:
 | Screen opens twice                                                            | Two `Strybok` instances, or you navigate from both `getInitialLink()` and your own handling of the intent/URL.                                                                                                          |
 | The old link opens again after rotating the device                            | `handleIntent(intent)` is called in `onCreate` without the `savedInstanceState == null` check.                                                                                                                          |
 | A second activity appears for a link while the app is open                    | The activity is not `singleTop` (or `singleTask`), so `onNewIntent` is not used.                                                                                                                                        |
-| `Strybok` is not visible in Swift                                             | The framework does not export the library: `export("com.strybok:strybok-kmp:0.2.0")` together with an `api(...)` dependency.                                                                                            |
+| `Strybok` is not visible in Swift                                             | The framework does not export the library: `export("com.strybok:strybok-kmp:0.3.0")` together with an `api(...)` dependency.                                                                                            |
 | Gradle: "plugin ... was not found" for the module                             | Declare both plugins with versions (`apply false`) in the root build file (step 2).                                                                                                                                     |
 | `IllegalStateException: Module with the Main dispatcher...` in JVM unit tests | Pass `coroutineContext` (a test dispatcher) as in step 10; Android's main thread does not exist in host tests.                                                                                                          |
 | Works on tap in Notes/Messages, not from Instagram/Telegram                   | In-app browsers often do not hand links to apps. Users get the fallback page with a manual button.                                                                                                                      |

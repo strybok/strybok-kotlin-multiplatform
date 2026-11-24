@@ -1,26 +1,34 @@
 package com.strybok.kmp
 
 import com.strybok.kmp.internal.appOpenEventBody
+import com.strybok.kmp.internal.AttestationApi
+import com.strybok.kmp.internal.AttestationSession
+import com.strybok.kmp.internal.Attestor
+import com.strybok.kmp.internal.KEY_REFUSED_MESSAGE
 import com.strybok.kmp.internal.NotJsonException
 import com.strybok.kmp.internal.asciiLowercase
 import com.strybok.kmp.internal.createLinkBody
 import com.strybok.kmp.internal.normalizeApiBaseUrl
 import com.strybok.kmp.internal.parseCreateLinkResponse
+import com.strybok.kmp.internal.parseAttestationError
 import com.strybok.kmp.internal.parseLinkUrl
 import com.strybok.kmp.internal.parseResolveResponse
 import com.strybok.kmp.internal.parseRetryAfterSeconds
 import com.strybok.kmp.internal.parseValidationError
 import com.strybok.kmp.internal.percentEncode
+import com.strybok.kmp.internal.platformAttestor
 import com.strybok.kmp.internal.platformCoroutineContext
 import com.strybok.kmp.internal.platformHttpTransport
 import com.strybok.kmp.internal.platformName
 import kotlin.concurrent.atomics.AtomicReference
 import kotlin.coroutines.CoroutineContext
 import kotlin.coroutines.cancellation.CancellationException
+import kotlin.time.Clock
 import kotlin.time.ComparableTimeMark
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
+import kotlin.time.Instant
 import kotlin.time.TimeSource
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
@@ -39,7 +47,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 
 /** Version reported with analytics events. */
-public const val STRYBOK_SDK_VERSION: String = "0.2.0"
+public const val STRYBOK_SDK_VERSION: String = "0.3.0"
 
 /** Returned by [Strybok.addListener]; call [cancel] to stop receiving links. */
 public fun interface Subscription {
@@ -80,6 +88,10 @@ public class Strybok internal constructor(
     coroutineContext: CoroutineContext,
     private val timeSource: TimeSource.WithComparableMarks,
     clientKey: String?,
+    /** How `createLink` proves it comes from a genuine app; `null` when it does not (the default). */
+    private val attestor: Attestor? = null,
+    /** Wall clock; only compared with the expiry of an attestation token. */
+    private val wallClock: () -> Instant = { Clock.System.now() },
 ) {
     /**
      * @param apiBaseUrl base URL of the API, e.g. `https://api.strybok.com`; a path prefix is kept.
@@ -95,6 +107,16 @@ public class Strybok internal constructor(
      *   "Links from the app". Only needed for [createLink]. It is safe to ship inside the app:
      *   it can only create links for the route patterns the owner listed. Never put a secret
      *   API key (`lb_…`) here.
+     * @param attestation extra protection for [createLink], off by default: prove to the service
+     *   that the request comes from a genuine build of the app on a genuine device — Apple App
+     *   Attest on iOS, Google Play Integrity on Android (which also needs
+     *   [integrityTokenProvider]). The JVM target cannot attest. Needs [clientKey]. The proof is
+     *   made lazily inside `createLink`, never when the SDK starts or a link arrives. See
+     *   `docs/link-creation-security.md` for what it does and does not protect.
+     * @param integrityTokenProvider Android only: where the Play Integrity token comes from when
+     *   [attestation] is on, usually a `PlayIntegrityTokenProvider`. `null` — for example in a
+     *   build for a market without Google Play — means the Android app cannot attest: links are
+     *   requested without a proof and the service decides. Ignored on iOS and the JVM.
      */
     public constructor(
         apiBaseUrl: String,
@@ -109,9 +131,12 @@ public class Strybok internal constructor(
         transport: HttpTransport = platformHttpTransport(),
         coroutineContext: CoroutineContext = platformCoroutineContext(),
         clientKey: String? = null,
+        attestation: Boolean = false,
+        integrityTokenProvider: IntegrityTokenProvider? = null,
     ) : this(
         apiBaseUrl, allowedHosts, timeout, maxRetries, retryDelay, dedupeWindow, reportAppOpens,
         onError, linkSource, transport, coroutineContext, TimeSource.Monotonic, clientKey,
+        if (attestation) platformAttestor(integrityTokenProvider) else null,
     )
 
     /** All defaults; convenient from Swift, where Kotlin default arguments are not available. */
@@ -128,6 +153,21 @@ public class Strybok internal constructor(
         clientKey: String?,
         onError: ((StrybokException) -> Unit)?,
     ) : this(apiBaseUrl, allowedHosts, timeout = 5.seconds, onError = onError, clientKey = clientKey)
+
+    /**
+     * All defaults plus the [clientKey] and the [attestation] switch for [createLink];
+     * convenient from Swift, where App Attest needs nothing else.
+     */
+    public constructor(
+        apiBaseUrl: String,
+        allowedHosts: Set<String>,
+        clientKey: String?,
+        attestation: Boolean,
+        onError: ((StrybokException) -> Unit)?,
+    ) : this(
+        apiBaseUrl, allowedHosts, timeout = 5.seconds, onError = onError, clientKey = clientKey,
+        attestation = attestation,
+    )
 
     init {
         require(maxRetries >= 0) { "maxRetries must not be negative" }
@@ -160,6 +200,9 @@ public class Strybok internal constructor(
     private val scope = CoroutineScope(SupervisorJob() + coroutineContext)
     private val state = AtomicReference(State())
     private val lastSeen = AtomicReference<Seen?>(null)
+
+    /** Created by the first [createLink] that needs it; never by [start] or an incoming link. */
+    private val attestation = AtomicReference<AttestationSession?>(null)
 
     private val startJob: Deferred<Unit> = scope.async(start = CoroutineStart.LAZY) {
         // Listen first so a link arriving during start-up is not missed. Undispatched: the
@@ -323,6 +366,12 @@ public class Strybok internal constructor(
      * Do not put personal data into [routePath] or [payload]: whoever receives the link can
      * read them.
      *
+     * With the `attestation` option switched on, the first call (and about one call an hour
+     * after that) first proves to the service that it comes from a genuine build of the app. A
+     * device that cannot produce the proof still sends the request; the service then decides,
+     * and answers with [StrybokAttestationRequiredException] when the owner only accepts
+     * attested apps.
+     *
      * @param routePath in-app route the link opens; starts with a single `/`, at most 512 characters.
      * @param payload optional JSON object attached to the link. Values may be `String`,
      *   `Boolean`, `Int`, `Long`, finite `Double`s, `null`, `List`s and `Map`s with `String`
@@ -333,8 +382,10 @@ public class Strybok internal constructor(
      * @throws StrybokException [StrybokUnauthorizedException] when no client key is configured
      *   (before any network call) or the service refuses it, [StrybokValidationException] when
      *   the request is rejected by the SDK or the service, [RouteNotAllowedException],
-     *   [StrybokRateLimitedException], and [StrybokNetworkException] /
-     *   [StrybokTimeoutException] / [StrybokServerException] after all retries.
+     *   [StrybokRateLimitedException], [StrybokAttestationRequiredException] /
+     *   [StrybokAttestationFailedException] when the owner asks for attestation, and
+     *   [StrybokNetworkException] / [StrybokTimeoutException] / [StrybokServerException] after
+     *   all retries.
      * @throws IllegalStateException after [dispose].
      */
     @Throws(StrybokException::class, IllegalStateException::class, CancellationException::class)
@@ -366,35 +417,73 @@ public class Strybok internal constructor(
         } catch (e: NotJsonException) {
             throw preflightFailure("payload", e.message.orEmpty())
         }
+        val session = attestor?.let { attestationSession(it, key) }
+        // Lazily, here and nowhere else: the first call attests, later ones reuse the token.
+        var token = session?.token()
+        var response = sendCreateLink(key, token, body)
+        if (session != null && token != null && response.attestationError()?.first == ATTESTATION_INVALID) {
+            // The token expired, is used up or was refused: attest again and repeat the same
+            // request, once. This does not count against maxRetries.
+            val reason = response.attestationError()?.second
+            session.discard(token)
+            token = session.token() ?: throw StrybokAttestationFailedException(reason)
+            response = sendCreateLink(key, token, body)
+            // Refused as well: the next call starts with a new attestation.
+            if (response.attestationError()?.first == ATTESTATION_INVALID) session.discard(token)
+        }
+        return when (val status = response.statusCode) {
+            200, 201 -> parseCreateLinkResponse(response.body)
+                ?: throw StrybokServerException("Malformed create-link response", null, status)
+            401 -> {
+                val (code, reason) = response.attestationError() ?: (null to null)
+                throw when (code) {
+                    ATTESTATION_REQUIRED -> StrybokAttestationRequiredException()
+                    ATTESTATION_INVALID -> StrybokAttestationFailedException(reason)
+                    else -> StrybokUnauthorizedException(KEY_REFUSED_MESSAGE)
+                }
+            }
+            403 -> throw RouteNotAllowedException(routePath)
+            429 -> throw StrybokRateLimitedException(parseRetryAfterSeconds(response.header("Retry-After")))
+            400, 413, 422 -> {
+                val (message, issues) = parseValidationError(response.body)
+                throw StrybokValidationException(
+                    message ?: "The service rejected the request (HTTP $status)", issues,
+                )
+            }
+            else -> throw StrybokServerException("Unexpected status $status", null, status)
+        }
+    }
+
+    /** One create-link request with the usual retries; returns the first answer below 500. */
+    private suspend fun sendCreateLink(key: String, token: String?, body: String): HttpResponse {
         val request = HttpRequest(
             method = "POST",
             url = "$apiBaseUrl/v1/public/links",
-            headers = mapOf(
-                "Content-Type" to "application/json",
-                "Accept" to "application/json",
-                "X-Strybok-Key" to key,
-            ),
+            headers = buildMap {
+                put("Content-Type", "application/json")
+                put("Accept", "application/json")
+                put("X-Strybok-Key", key)
+                if (token != null) put("X-Strybok-Attestation", token)
+            },
             body = body,
             timeout = timeout,
         )
-        return send(request, null, "The create-link request timed out") { response ->
-            when (val status = response.statusCode) {
-                200, 201 -> parseCreateLinkResponse(response.body)
-                    ?: throw StrybokServerException("Malformed create-link response", null, status)
-                401 -> throw StrybokUnauthorizedException(
-                    "The client key was refused: it is wrong or was replaced, or link creation is switched off",
-                )
-                403 -> throw RouteNotAllowedException(routePath)
-                429 -> throw StrybokRateLimitedException(parseRetryAfterSeconds(response.header("Retry-After")))
-                400, 413, 422 -> {
-                    val (message, issues) = parseValidationError(response.body)
-                    throw StrybokValidationException(
-                        message ?: "The service rejected the request (HTTP $status)", issues,
-                    )
-                }
-                else -> throw StrybokServerException("Unexpected status $status", null, status)
-            }
-        }
+        return send(request, null, "The create-link request timed out") { it }
+    }
+
+    private fun attestationSession(attestor: Attestor, key: String): AttestationSession {
+        attestation.load()?.let { return it }
+        val created = AttestationSession(
+            attestor, AttestationApi(apiBaseUrl, key, timeout, transport), scope, timeSource, wallClock,
+        )
+        return if (attestation.compareAndSet(null, created)) created else attestation.load() ?: created
+    }
+
+    /** `error.code` and `error.details.reason` of a 401 that is about attestation; `null` otherwise. */
+    private fun HttpResponse.attestationError(): Pair<String, String?>? {
+        if (statusCode != 401) return null
+        val (code, reason) = parseAttestationError(body)
+        return if (code == ATTESTATION_INVALID || code == ATTESTATION_REQUIRED) code to reason else null
     }
 
     /** [createLink] with only a route; convenient from Swift, where default arguments are not available. */
@@ -566,5 +655,7 @@ public class Strybok internal constructor(
 
     private companion object {
         const val MAX_ROUTE_PATH_LENGTH = 512
+        const val ATTESTATION_INVALID = "ATTESTATION_INVALID"
+        const val ATTESTATION_REQUIRED = "ATTESTATION_REQUIRED"
     }
 }

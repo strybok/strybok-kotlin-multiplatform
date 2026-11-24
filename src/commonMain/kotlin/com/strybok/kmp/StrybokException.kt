@@ -92,3 +92,24 @@ public class StrybokValidationException(
     /** The individual problems reported by the service; empty when there are none. */
     public val issues: List<StrybokValidationIssue>,
 ) : StrybokException(message, null)
+
+/**
+ * [Strybok.createLink] only: the owner of the application only accepts links from apps that
+ * proved they are genuine (attestation mode "Required"), and this request carried no proof —
+ * the `attestation` option is off, or this device or build cannot attest (a simulator, no
+ * Google Play services, not installed from Google Play, a desktop JVM). Retrying does not
+ * help. On such a device this is expected: tell the user that sharing is not available here
+ * rather than show an error.
+ */
+public class StrybokAttestationRequiredException :
+    StrybokException("This application only accepts links from apps that passed attestation", null)
+
+/**
+ * [Strybok.createLink] only: the service refused the attestation token, the SDK attested again
+ * and the fresh token was refused as well (or a fresh one could not be obtained). Retrying does
+ * not help; check the attestation set-up of the application in the dashboard.
+ */
+public class StrybokAttestationFailedException(
+    /** The service's reason word (`invalid`, `expired` or `exhausted`); `null` when it gave none. */
+    public val reason: String?,
+) : StrybokException("The attestation token was refused", null)

@@ -1,9 +1,11 @@
 package com.strybok.kmp
 
+import com.strybok.kmp.internal.Attestor
 import com.strybok.kmp.testing.FakeLinkSource
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
+import kotlin.time.Instant
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
@@ -55,8 +57,8 @@ class FakeApi(var onResolve: (suspend (HttpRequest) -> HttpResponse)? = null) : 
 
 @OptIn(ExperimentalCoroutinesApi::class)
 /** An SDK instance running entirely on the virtual time of this test. */
-fun TestScope.sdk(
-    api: FakeApi,
+internal fun TestScope.sdk(
+    api: HttpTransport,
     source: LinkSource = FakeLinkSource(),
     errors: MutableList<StrybokException>? = null,
     maxRetries: Int = 2,
@@ -66,6 +68,8 @@ fun TestScope.sdk(
     apiBaseUrl: String = API,
     allowedHosts: Set<String> = setOf(HOST),
     clientKey: String? = CLIENT_KEY,
+    attestor: Attestor? = null,
+    wallClock: () -> Instant = { wallClockOf(this) },
 ): Strybok = Strybok(
     apiBaseUrl = apiBaseUrl,
     allowedHosts = allowedHosts,
@@ -80,7 +84,16 @@ fun TestScope.sdk(
     coroutineContext = StandardTestDispatcher(testScheduler),
     timeSource = testScheduler.timeSource,
     clientKey = clientKey,
+    attestor = attestor,
+    wallClock = wallClock,
 )
+
+/** 2026-11-24T10:00:00Z, the wall-clock time at which every test starts. */
+val T0: Instant = Instant.parse("2026-11-24T10:00:00Z")
+
+@OptIn(ExperimentalCoroutinesApi::class)
+/** A wall clock that moves with the virtual time of the test. */
+fun wallClockOf(scope: TestScope): Instant = T0 + scope.testScheduler.currentTime.milliseconds
 
 @OptIn(ExperimentalCoroutinesApi::class)
 /** Collects [Strybok.links] into a list; the collector is attached when this returns. */

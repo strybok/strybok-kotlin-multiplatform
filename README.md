@@ -28,6 +28,51 @@ val link = strybok.createLink("/product/42", payload = mapOf("productId" to 42),
 share(link.url)
 ```
 
+### Extra protection (optional)
+
+The publishable key can be copied out of an app. The owner of the application can therefore ask
+Strybok to accept link requests only — or preferably — from a genuine build of the app on a
+genuine device, proved with Apple **App Attest** on iOS and Google **Play Integrity** on Android
+(the JVM target cannot attest). It is **off by default**, and the SDK does not depend on
+Google's libraries: an Android app adds `com.google.android.play:integrity` itself.
+
+```kotlin
+val strybok = Strybok(
+    apiBaseUrl = "https://api.strybok.com",
+    allowedHosts = setOf("my-app.strybok.link"),
+    clientKey = "pk_…",
+    attestation = true, // all that iOS needs
+    // Android only, created in Android code:
+    // PlayIntegrityTokenProvider(applicationContext, cloudProjectNumber = 123456789012L)
+    integrityTokenProvider = integrityTokenProvider,
+)
+```
+
+Before that: add the **App Attest** capability to the iOS app target in Xcode; for Android, link
+a Google Cloud project with the Play Integrity API to the app in the Play Console and upload a
+service-account key in the Strybok dashboard; then choose the mode in the dashboard
+(**Preferred** first). The steps are in the
+[integration guide](./docs/kotlin-multiplatform.md#extra-protection) and in
+[Keeping link creation from your app safe](./docs/link-creation-security.md).
+
+`createLink` is called as before; the proof is made lazily inside it, about once an hour, never
+at start-up. Two more errors can come out: `StrybokAttestationRequiredException` (the owner
+requires a proof and this device or build could not give one) and
+`StrybokAttestationFailedException` (a fresh proof was refused twice). A device that cannot
+attest still sends the request, and the service decides.
+
+Limits you should know:
+
+- iOS: App Attest needs iOS 14 or later and a **real device**; it does not work in the
+  simulator.
+- Android: it needs Google Play services, the Play Store and a build **installed from Google
+  Play**. It does not work on devices without Google services (most devices in mainland China,
+  Huawei without GMS) or for sideloaded builds. For a flavour without Google libraries, leave
+  the dependency out and pass no provider.
+- Google allows 10,000 integrity requests a day per app by default.
+- **It has never run against Apple's or Google's real services or on a physical device** — only
+  against fakes in unit tests. Treat the **Required** mode as experimental.
+
 Full guide, native setup and troubleshooting:
 [`docs/kotlin-multiplatform.md`](./docs/kotlin-multiplatform.md).
 Behaviour shared by all SDKs: [`docs/sdk-contract.md`](./docs/sdk-contract.md).
@@ -37,8 +82,9 @@ Behaviour shared by all SDKs: [`docs/sdk-contract.md`](./docs/sdk-contract.md).
 - Dependencies: `kotlinx-coroutines-core` and `kotlinx-serialization-json` (plus
   `kotlinx-coroutines-android` on Android). HTTP uses the platform clients — `HttpURLConnection`
   and `NSURLSession` — behind the small `HttpTransport` interface: three GET/POST calls do not
-  justify shipping Ktor and an engine per platform into every app.
-- **Early release (0.2.x)**: covered by unit tests on the JVM, Android host tests and the iOS simulator. **Not verified on
+  justify shipping Ktor and an engine per platform into every app. Google's Play Integrity
+  library is not a dependency; only Android apps that switch attestation on add it.
+- **Early release (0.3.x)**: covered by unit tests on the JVM, Android host tests and the iOS simulator. **Not verified on
   a physical device.**
 - Deferred deep linking is not supported.
 
@@ -50,7 +96,7 @@ The library is on Maven Central. In your shared module:
 kotlin {
     sourceSets {
         commonMain.dependencies {
-            api("com.strybok:strybok-kmp:0.2.0")
+            api("com.strybok:strybok-kmp:0.3.0")
         }
     }
 }

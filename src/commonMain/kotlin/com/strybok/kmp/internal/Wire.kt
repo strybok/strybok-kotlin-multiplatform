@@ -138,6 +138,17 @@ internal fun parseValidationError(body: String): Pair<String?, List<StrybokValid
     return error.string("message")?.takeIf { it.isNotBlank() } to issues
 }
 
+/**
+ * `error.code` and `error.details.reason` of an error answer. The reason is only passed on when
+ * it looks like one of the service's reason words, never free text.
+ */
+internal fun parseAttestationError(body: String): Pair<String?, String?> {
+    val error = parseObject(body)?.get("error") as? JsonObject ?: return null to null
+    val reason = (error["details"] as? JsonObject)?.string("reason")
+        ?.takeIf { it.length in 1..32 && it.all { char -> char in 'a'..'z' || char == '_' } }
+    return error.string("code") to reason
+}
+
 /** Seconds from a `Retry-After` header; `null` when it is missing or not a number of seconds. */
 internal fun parseRetryAfterSeconds(header: String?): Long? {
     val value = header?.trim().orEmpty()

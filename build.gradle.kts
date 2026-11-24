@@ -8,7 +8,7 @@ plugins {
 }
 
 group = "com.strybok"
-version = "0.2.0"
+version = "0.3.0"
 
 val coroutinesVersion = "1.10.2"
 val serializationVersion = "1.9.0"
@@ -26,6 +26,11 @@ kotlin {
         minSdk = 21
         compilerOptions { jvmTarget.set(JvmTarget.JVM_11) }
         withHostTestBuilder {}
+        // Shipped inside the AAR: see the file for why the SDK needs a rule at all.
+        optimization {
+            consumerKeepRules.publish = true
+            consumerKeepRules.file("consumer-rules.pro")
+        }
     }
 
     iosArm64()
@@ -59,6 +64,10 @@ kotlin {
         androidMain.dependencies {
             // Provides Dispatchers.Main on Android.
             implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:$coroutinesVersion")
+            // Only PlayIntegrityTokenProvider uses it, and only to compile: the published
+            // artifact does not depend on Google's libraries. An app that wants attestation on
+            // Android adds the library itself.
+            compileOnly("com.google.android.play:integrity:1.4.0")
         }
     }
 }
