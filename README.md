@@ -28,26 +28,26 @@ Behaviour shared by all SDKs: [`docs/sdk-contract.md`](./docs/sdk-contract.md).
   `kotlinx-coroutines-android` on Android). HTTP uses the platform clients — `HttpURLConnection`
   and `NSURLSession` — behind the small `HttpTransport` interface: two GET/POST calls do not
   justify shipping Ktor and an engine per platform into every app.
-- Not published to Maven Central yet: clone
-  `https://github.com/strybok/strybok-kotlin-multiplatform` and include it in your Gradle build
-  (see Install).
-- Covered by unit tests on the JVM, Android host tests and the iOS simulator. **Not verified on
+- **Early release (0.1.x)**: covered by unit tests on the JVM, Android host tests and the iOS simulator. **Not verified on
   a physical device.**
 - Deferred deep linking is not supported.
 
 ## Install
 
-Clone the repository next to your app (or add it as a git submodule), then in the app's
-`settings.gradle.kts`:
+The library is on Maven Central. In your shared module:
 
 ```kotlin
-include(":strybok-kmp")
-project(":strybok-kmp").projectDir = file("../strybok-kotlin-multiplatform") // path to your clone
+kotlin {
+    sourceSets {
+        commonMain.dependencies {
+            api("com.strybok:strybok-kmp:0.1.0")
+        }
+    }
+}
 ```
 
-Declare the Kotlin Multiplatform and Android-KMP library plugins in your root build file and add
-`api(project(":strybok-kmp"))` to `commonMain`; the guide has the details and the
-`includeBuild` (composite build) alternative.
+To let Swift see the `Strybok` class, also `export` the same coordinates from your iOS framework;
+the guide has the details.
 
 ## Build and test
 

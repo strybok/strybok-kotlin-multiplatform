@@ -6,8 +6,9 @@ route the link stands for, and gives your shared code each link exactly once.
 
 > **Status:** covered by unit tests on the JVM, Android host tests and the iOS simulator
 > (Kotlin/Native), and the Swift snippets below type-check against the generated framework.
-> **Not verified on a physical device** (see the [manual test plan](./manual-test-plan.md)), not
-> tried inside a complete Compose Multiplatform app, and not published to Maven Central.
+> Early release (0.1.x), published on Maven Central. **Not verified on a physical device** (see
+> the [manual test plan](./manual-test-plan.md)) and not tried inside a complete Compose
+> Multiplatform app.
 >
 > Deferred deep linking is **not supported**: a link tapped before the app is installed is not
 > restored after installation.
@@ -26,48 +27,26 @@ It follows the [SDK contract](./sdk-contract.md) shared by all Strybok SDKs.
 
 ## 2. Add the library
 
-It is not on Maven Central yet. Clone its repository next to your app (or add it as a git
-submodule) and include it as a Gradle module:
-
-```sh
-git clone https://github.com/strybok/strybok-kotlin-multiplatform
-```
-
-`settings.gradle.kts` of your app:
-
-```kotlin
-include(":strybok-kmp")
-project(":strybok-kmp").projectDir = file("../strybok-kotlin-multiplatform") // path to your clone
-```
-
-The module applies two plugins without versions, so your build must know them. In the root
-`build.gradle.kts` (use the versions your project already has):
-
-```kotlin
-plugins {
-    id("org.jetbrains.kotlin.multiplatform") version "2.3.20" apply false
-    id("com.android.kotlin.multiplatform.library") version "9.0.1" apply false
-}
-```
-
-Then depend on it from your shared module, and export it to the iOS framework so Swift sees
-the `Strybok` class:
+The library is on Maven Central. Depend on it from your shared module, and export it to the iOS
+framework so Swift sees the `Strybok` class:
 
 ```kotlin
 kotlin {
     listOf(iosArm64(), iosSimulatorArm64()).forEach { target ->
         target.binaries.framework {
             baseName = "Shared"
-            export(project(":strybok-kmp"))
+            export("com.strybok:strybok-kmp:0.1.0")
         }
     }
     sourceSets {
         commonMain.dependencies {
-            api(project(":strybok-kmp"))
+            api("com.strybok:strybok-kmp:0.1.0")
         }
     }
 }
 ```
+
+`mavenCentral()` must be among your repositories.
 
 Requirements and what was tried:
 
@@ -76,11 +55,11 @@ Requirements and what was tried:
   and common atomics from the Kotlin standard library, so it needs Kotlin 2.1.20 or newer;
   older combinations were not tried.
 - Android `minSdk` 21. iOS targets: `iosArm64`, `iosSimulatorArm64`, `iosX64`.
-- A composite build also works for the targets that were tried (JVM and iOS simulator):
-  `includeBuild("../strybok-kotlin-multiplatform")` in `settings.gradle.kts`, then
-  `implementation("com.strybok:strybok-kmp:0.1.0")`. Both builds must then use the same Kotlin
-  and Android Gradle plugin versions. For Android, the module approach above is the one that
-  was verified.
+- To build from source instead, clone
+  [github.com/strybok/strybok-kotlin-multiplatform](https://github.com/strybok/strybok-kotlin-multiplatform)
+  and add `includeBuild("../strybok-kotlin-multiplatform")` to `settings.gradle.kts`; Gradle then
+  substitutes the same coordinates with the clone. Both builds must use the same Kotlin and
+  Android Gradle plugin versions.
 
 The library adds the `android.permission.INTERNET` permission to your manifest.
 
@@ -377,7 +356,7 @@ Associated Domains entitlement to route the URL to your app).
 | Screen opens twice                                                            | Two `Strybok` instances, or you navigate from both `getInitialLink()` and your own handling of the intent/URL.                                                                                                          |
 | The old link opens again after rotating the device                            | `handleIntent(intent)` is called in `onCreate` without the `savedInstanceState == null` check.                                                                                                                          |
 | A second activity appears for a link while the app is open                    | The activity is not `singleTop` (or `singleTask`), so `onNewIntent` is not used.                                                                                                                                        |
-| `Strybok` is not visible in Swift                                             | The framework does not export the library: `export(project(":strybok-kmp"))` together with an `api(...)` dependency.                                                                                                    |
+| `Strybok` is not visible in Swift                                             | The framework does not export the library: `export("com.strybok:strybok-kmp:0.1.0")` together with an `api(...)` dependency.                                                                                            |
 | Gradle: "plugin ... was not found" for the module                             | Declare both plugins with versions (`apply false`) in the root build file (step 2).                                                                                                                                     |
 | `IllegalStateException: Module with the Main dispatcher...` in JVM unit tests | Pass `coroutineContext` (a test dispatcher) as in step 10; Android's main thread does not exist in host tests.                                                                                                          |
 | Works on tap in Notes/Messages, not from Instagram/Telegram                   | In-app browsers often do not hand links to apps. Users get the fallback page with a manual button.                                                                                                                      |
