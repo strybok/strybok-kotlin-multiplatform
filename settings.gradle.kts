@@ -11,6 +11,7 @@ pluginManagement {
     plugins {
         id("org.jetbrains.kotlin.multiplatform") version "2.3.20"
         id("com.android.kotlin.multiplatform.library") version "9.0.1"
+        id("com.vanniktech.maven.publish") version "0.37.0"
     }
 }
 
