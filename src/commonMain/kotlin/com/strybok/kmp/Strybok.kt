@@ -1,10 +1,15 @@
 package com.strybok.kmp
 
 import com.strybok.kmp.internal.appOpenEventBody
+import com.strybok.kmp.internal.NotJsonException
 import com.strybok.kmp.internal.asciiLowercase
+import com.strybok.kmp.internal.createLinkBody
 import com.strybok.kmp.internal.normalizeApiBaseUrl
+import com.strybok.kmp.internal.parseCreateLinkResponse
 import com.strybok.kmp.internal.parseLinkUrl
 import com.strybok.kmp.internal.parseResolveResponse
+import com.strybok.kmp.internal.parseRetryAfterSeconds
+import com.strybok.kmp.internal.parseValidationError
 import com.strybok.kmp.internal.percentEncode
 import com.strybok.kmp.internal.platformCoroutineContext
 import com.strybok.kmp.internal.platformHttpTransport
@@ -34,7 +39,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 
 /** Version reported with analytics events. */
-public const val STRYBOK_SDK_VERSION: String = "0.1.0"
+public const val STRYBOK_SDK_VERSION: String = "0.2.0"
 
 /** Returned by [Strybok.addListener]; call [cancel] to stop receiving links. */
 public fun interface Subscription {
@@ -53,14 +58,15 @@ public fun interface Subscription {
  * scope.launch { strybok.start() }
  * ```
  *
- * Every resolved link is delivered exactly once. The class is thread-safe.
+ * Every resolved link is delivered exactly once. [createLink] makes a link to share; it needs
+ * a `clientKey` and is independent of incoming links. The class is thread-safe.
  */
 public class Strybok internal constructor(
     apiBaseUrl: String,
     allowedHosts: Set<String>,
-    /** Time allowed for one resolve attempt. */
+    /** Time allowed for one attempt of a resolve or create-link request. */
     public val timeout: Duration,
-    /** Extra attempts after a timeout, network error or 5xx. `404` is never retried. */
+    /** Extra attempts after a timeout, network error or 5xx. 4xx answers are never retried. */
     public val maxRetries: Int,
     /** Pause before the first retry; doubles for each further retry. */
     public val retryDelay: Duration,
@@ -73,6 +79,7 @@ public class Strybok internal constructor(
     private val transport: HttpTransport,
     coroutineContext: CoroutineContext,
     private val timeSource: TimeSource.WithComparableMarks,
+    clientKey: String?,
 ) {
     /**
      * @param apiBaseUrl base URL of the API, e.g. `https://api.strybok.com`; a path prefix is kept.
@@ -84,6 +91,10 @@ public class Strybok internal constructor(
      * @param transport performs the HTTP calls; replace it in tests.
      * @param coroutineContext where the SDK works and where [onError] and listeners are called;
      *   the main thread on Android and iOS by default.
+     * @param clientKey publishable key of the application (`pk_…`), shown in the dashboard under
+     *   "Links from the app". Only needed for [createLink]. It is safe to ship inside the app:
+     *   it can only create links for the route patterns the owner listed. Never put a secret
+     *   API key (`lb_…`) here.
      */
     public constructor(
         apiBaseUrl: String,
@@ -97,9 +108,10 @@ public class Strybok internal constructor(
         linkSource: LinkSource = PushLinkSource(),
         transport: HttpTransport = platformHttpTransport(),
         coroutineContext: CoroutineContext = platformCoroutineContext(),
+        clientKey: String? = null,
     ) : this(
         apiBaseUrl, allowedHosts, timeout, maxRetries, retryDelay, dedupeWindow, reportAppOpens,
-        onError, linkSource, transport, coroutineContext, TimeSource.Monotonic,
+        onError, linkSource, transport, coroutineContext, TimeSource.Monotonic, clientKey,
     )
 
     /** All defaults; convenient from Swift, where Kotlin default arguments are not available. */
@@ -108,6 +120,14 @@ public class Strybok internal constructor(
         allowedHosts: Set<String>,
         onError: ((StrybokException) -> Unit)?,
     ) : this(apiBaseUrl, allowedHosts, timeout = 5.seconds, onError = onError)
+
+    /** All defaults plus the [clientKey] for [createLink]; convenient from Swift. */
+    public constructor(
+        apiBaseUrl: String,
+        allowedHosts: Set<String>,
+        clientKey: String?,
+        onError: ((StrybokException) -> Unit)?,
+    ) : this(apiBaseUrl, allowedHosts, timeout = 5.seconds, onError = onError, clientKey = clientKey)
 
     init {
         require(maxRetries >= 0) { "maxRetries must not be negative" }
@@ -120,6 +140,9 @@ public class Strybok internal constructor(
 
     /** Link hostnames of this app, lower-case. */
     public val allowedHosts: Set<String> = allowedHosts.mapTo(mutableSetOf()) { it.asciiLowercase() }
+
+    /** The publishable key without surrounding whitespace; `null` when none was given. */
+    private val clientKey: String? = clientKey?.trim()?.takeIf { it.isNotEmpty() }
 
     private class State(
         val subscribers: List<Channel<ResolvedDeepLink>> = emptyList(),
@@ -273,41 +296,111 @@ public class Strybok internal constructor(
             body = null,
             timeout = timeout,
         )
-
-        lateinit var lastError: StrybokException
-        for (attempt in 0..maxRetries) {
-            if (attempt > 0) delay(retryDelay * (1 shl (attempt - 1).coerceAtMost(16)))
-            checkNotDisposed()
-            val response = try {
-                withTimeoutOrNull(timeout) { transport.execute(request) }
-            } catch (e: CancellationException) {
-                currentCoroutineContext().ensureActive() // We were cancelled: propagate.
-                lastError = StrybokNetworkException("The request was cancelled", url, e)
-                continue
-            } catch (_: HttpTimeoutException) {
-                lastError = StrybokTimeoutException(url)
-                continue
-            } catch (e: Exception) {
-                lastError = StrybokNetworkException("Network error", url, e)
-                continue
-            }
-            when {
-                response == null -> lastError = StrybokTimeoutException(url)
-                response.statusCode == 200 ->
-                    return parseResolveResponse(url, response.body)
-                        ?: throw StrybokServerException("Malformed resolve response", url, 200)
-                response.statusCode == 404 -> throw LinkNotFoundException(url)
-                else -> {
-                    val error = StrybokServerException(
-                        "Unexpected status ${response.statusCode}", url, response.statusCode,
-                    )
-                    if (response.statusCode < 500) throw error // Client errors will not improve.
-                    lastError = error
-                }
+        return send(request, url, "The resolve request timed out") { response ->
+            when (val status = response.statusCode) {
+                200 -> parseResolveResponse(url, response.body)
+                    ?: throw StrybokServerException("Malformed resolve response", url, 200)
+                404 -> throw LinkNotFoundException(url)
+                // Client errors will not improve.
+                else -> throw StrybokServerException("Unexpected status $status", url, status)
             }
         }
-        throw lastError
     }
+
+    /**
+     * Asks the service for a short link to a screen of this app — the "Share" button.
+     *
+     * Needs the `clientKey` constructor argument and the "Links from the app" feature enabled
+     * for the application in the dashboard, with a route pattern that covers [routePath]. It
+     * runs only when you call it, is independent of [start] and of incoming links, and does not
+     * use [allowedHosts].
+     *
+     * Creating is idempotent: the same content always returns the same active link, so
+     * timeouts, network errors and 5xx answers are retried like for [resolve], and repeated
+     * taps on "Share" do not pile up links. Errors are thrown to the caller and never reach
+     * `onError`.
+     *
+     * Do not put personal data into [routePath] or [payload]: whoever receives the link can
+     * read them.
+     *
+     * @param routePath in-app route the link opens; starts with a single `/`, at most 512 characters.
+     * @param payload optional JSON object attached to the link. Values may be `String`,
+     *   `Boolean`, `Int`, `Long`, finite `Double`s, `null`, `List`s and `Map`s with `String`
+     *   keys (a kotlinx.serialization `JsonObject` works too).
+     * @param title optional title of the link preview.
+     * @param description optional description of the link preview.
+     * @param imageUrl optional public HTTPS URL of the link preview image.
+     * @throws StrybokException [StrybokUnauthorizedException] when no client key is configured
+     *   (before any network call) or the service refuses it, [StrybokValidationException] when
+     *   the request is rejected by the SDK or the service, [RouteNotAllowedException],
+     *   [StrybokRateLimitedException], and [StrybokNetworkException] /
+     *   [StrybokTimeoutException] / [StrybokServerException] after all retries.
+     * @throws IllegalStateException after [dispose].
+     */
+    @Throws(StrybokException::class, IllegalStateException::class, CancellationException::class)
+    public suspend fun createLink(
+        routePath: String,
+        payload: Map<String, Any?>? = null,
+        title: String? = null,
+        description: String? = null,
+        imageUrl: String? = null,
+    ): CreatedLink {
+        checkNotDisposed()
+        val key = clientKey ?: throw StrybokUnauthorizedException("No clientKey is configured")
+        // A real key is plain ASCII. Anything else can only be refused, and must not reach an
+        // HTTP header (or an error message of the HTTP stack complaining about it).
+        if (!key.all { it in '!'..'~' }) {
+            throw StrybokUnauthorizedException("The configured clientKey is not a valid key")
+        }
+        if (!routePath.startsWith("/") || routePath.startsWith("//") ||
+            routePath.length > MAX_ROUTE_PATH_LENGTH
+        ) {
+            throw preflightFailure(
+                "routePath",
+                "routePath must start with a single '/' and be at most $MAX_ROUTE_PATH_LENGTH characters long",
+            )
+        }
+        // Built once: every retry sends exactly the same body.
+        val body = try {
+            createLinkBody(routePath, payload, title, description, imageUrl)
+        } catch (e: NotJsonException) {
+            throw preflightFailure("payload", e.message.orEmpty())
+        }
+        val request = HttpRequest(
+            method = "POST",
+            url = "$apiBaseUrl/v1/public/links",
+            headers = mapOf(
+                "Content-Type" to "application/json",
+                "Accept" to "application/json",
+                "X-Strybok-Key" to key,
+            ),
+            body = body,
+            timeout = timeout,
+        )
+        return send(request, null, "The create-link request timed out") { response ->
+            when (val status = response.statusCode) {
+                200, 201 -> parseCreateLinkResponse(response.body)
+                    ?: throw StrybokServerException("Malformed create-link response", null, status)
+                401 -> throw StrybokUnauthorizedException(
+                    "The client key was refused: it is wrong or was replaced, or link creation is switched off",
+                )
+                403 -> throw RouteNotAllowedException(routePath)
+                429 -> throw StrybokRateLimitedException(parseRetryAfterSeconds(response.header("Retry-After")))
+                400, 413, 422 -> {
+                    val (message, issues) = parseValidationError(response.body)
+                    throw StrybokValidationException(
+                        message ?: "The service rejected the request (HTTP $status)", issues,
+                    )
+                }
+                else -> throw StrybokServerException("Unexpected status $status", null, status)
+            }
+        }
+    }
+
+    /** [createLink] with only a route; convenient from Swift, where default arguments are not available. */
+    @Throws(StrybokException::class, IllegalStateException::class, CancellationException::class)
+    public suspend fun createLink(routePath: String): CreatedLink =
+        createLink(routePath, null, null, null, null)
 
     /**
      * Stops listening and releases resources: nothing is delivered afterwards, including a
@@ -321,6 +414,49 @@ public class Strybok internal constructor(
     }
 
     // ---------------------------------------------------------------------------------------
+
+    /**
+     * Sends [request], retrying after a timeout, a transport failure or a 5xx answer: up to
+     * [maxRetries] extra attempts, pausing [retryDelay] before the first retry and twice as
+     * long before each further one. Every other answer goes to [onAnswer], whose result or
+     * exception is final.
+     */
+    private suspend fun <T> send(
+        request: HttpRequest,
+        url: String?,
+        timeoutMessage: String,
+        onAnswer: (HttpResponse) -> T,
+    ): T {
+        lateinit var lastError: StrybokException
+        for (attempt in 0..maxRetries) {
+            if (attempt > 0) delay(retryDelay * (1 shl (attempt - 1).coerceAtMost(16)))
+            checkNotDisposed()
+            val response = try {
+                withTimeoutOrNull(timeout) { transport.execute(request) }
+            } catch (e: CancellationException) {
+                currentCoroutineContext().ensureActive() // We were cancelled: propagate.
+                lastError = StrybokNetworkException("The request was cancelled", url, e)
+                continue
+            } catch (_: HttpTimeoutException) {
+                lastError = StrybokTimeoutException(timeoutMessage, url)
+                continue
+            } catch (e: Exception) {
+                lastError = StrybokNetworkException("Network error", url, e)
+                continue
+            }
+            when {
+                response == null -> lastError = StrybokTimeoutException(timeoutMessage, url)
+                response.statusCode < 500 -> return onAnswer(response)
+                else -> lastError = StrybokServerException(
+                    "Unexpected status ${response.statusCode}", url, response.statusCode,
+                )
+            }
+        }
+        throw lastError
+    }
+
+    private fun preflightFailure(field: String, message: String): StrybokValidationException =
+        StrybokValidationException(message, listOf(StrybokValidationIssue(field, message)))
 
     /** Cheap, synchronous checks done in arrival order: ours, and not a duplicate delivery. */
     private fun accept(url: String): Boolean =
@@ -426,5 +562,9 @@ public class Strybok internal constructor(
 
     private fun checkNotDisposed() {
         if (state.load().disposed) throw DisposedException()
+    }
+
+    private companion object {
+        const val MAX_ROUTE_PATH_LENGTH = 512
     }
 }

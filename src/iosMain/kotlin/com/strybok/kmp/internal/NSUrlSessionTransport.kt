@@ -70,7 +70,12 @@ internal object NSUrlSessionTransport : HttpTransport {
                         continuation.resumeWithException(Exception("Response body is too large"))
                     else -> {
                         val body = data?.let { NSString.create(data = it, encoding = NSUTF8StringEncoding) }
-                        continuation.resume(HttpResponse(http.statusCode.toInt(), body?.toString() ?: ""))
+                        val headers = buildMap {
+                            http.allHeaderFields.forEach { (name, value) ->
+                                if (name is String && value is String) put(name, value)
+                            }
+                        }
+                        continuation.resume(HttpResponse(http.statusCode.toInt(), body?.toString() ?: "", headers))
                     }
                 }
             }

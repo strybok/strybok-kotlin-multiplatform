@@ -22,18 +22,31 @@ fun ok(route: String = "/invite/abc123", linkId: String = "link_1"): HttpRespons
     """{"linkId":"$linkId","appId":"app_1","routePath":"$route","payload":{"invitationId":"abc123"}}""",
 )
 
-/** Records requests and answers resolve calls with [onResolve]. */
+const val CLIENT_KEY = "pk_0123456789abcdefghijABCDEFGHIJ01"
+
+fun created(status: Int = 201, slug: String = "Ab3dE9x"): HttpResponse = HttpResponse(
+    status,
+    """{"linkId":"link_9","url":"https://$HOST/$slug","slug":"$slug","routePath":"/product/42"}""",
+)
+
+/** Records requests and answers resolve calls with [onResolve] and create-link calls with [onCreate]. */
 class FakeApi(var onResolve: (suspend (HttpRequest) -> HttpResponse)? = null) : HttpTransport {
     val resolves = mutableListOf<HttpRequest>()
     val eventRequests = mutableListOf<HttpRequest>()
     val events = mutableListOf<JsonObject>()
     var onEvent: (suspend () -> HttpResponse)? = null
+    val creates = mutableListOf<HttpRequest>()
+    var onCreate: (suspend (HttpRequest) -> HttpResponse)? = null
 
     override suspend fun execute(request: HttpRequest): HttpResponse {
         if (request.url.endsWith("/v1/public/events")) {
             eventRequests += request
             events += Json.parseToJsonElement(request.body!!).jsonObject
             return onEvent?.invoke() ?: HttpResponse(202, "")
+        }
+        if (request.url.endsWith("/v1/public/links")) {
+            creates += request
+            return onCreate?.invoke(request) ?: created()
         }
         resolves += request
         return onResolve?.invoke(request) ?: ok()
@@ -52,6 +65,7 @@ fun TestScope.sdk(
     reportAppOpens: Boolean = true,
     apiBaseUrl: String = API,
     allowedHosts: Set<String> = setOf(HOST),
+    clientKey: String? = CLIENT_KEY,
 ): Strybok = Strybok(
     apiBaseUrl = apiBaseUrl,
     allowedHosts = allowedHosts,
@@ -65,6 +79,7 @@ fun TestScope.sdk(
     transport = api,
     coroutineContext = StandardTestDispatcher(testScheduler),
     timeSource = testScheduler.timeSource,
+    clientKey = clientKey,
 )
 
 @OptIn(ExperimentalCoroutinesApi::class)

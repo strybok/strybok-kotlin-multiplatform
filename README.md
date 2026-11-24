@@ -1,5 +1,7 @@
 # strybok-kmp (Kotlin Multiplatform SDK)
 
+[![Maven Central](https://img.shields.io/maven-metadata/v?metadataUrl=https%3A%2F%2Frepo1.maven.org%2Fmaven2%2Fcom%2Fstrybok%2Fstrybok-kmp%2Fmaven-metadata.xml&label=maven%20central)](https://central.sonatype.com/artifact/com.strybok/strybok-kmp) [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](./LICENSE)
+
 Receives iOS Universal Links / Android App Links in a Kotlin Multiplatform or Compose
 Multiplatform app, resolves them through the Strybok API to an in-app route and payload, and
 delivers each link exactly once — on cold start, from the background and in the foreground.
@@ -18,6 +20,14 @@ scope.launch { strybok.start() }
 // iOS:     strybok.handleUrl(url: url) or strybok.handleUserActivity(userActivity: activity)
 ```
 
+Create a link to share (needs the application's publishable key, `clientKey = "pk_…"`, and the
+"Links from the app" feature enabled in the dashboard):
+
+```kotlin
+val link = strybok.createLink("/product/42", payload = mapOf("productId" to 42), title = "Red shoes")
+share(link.url)
+```
+
 Full guide, native setup and troubleshooting:
 [`docs/kotlin-multiplatform.md`](./docs/kotlin-multiplatform.md).
 Behaviour shared by all SDKs: [`docs/sdk-contract.md`](./docs/sdk-contract.md).
@@ -26,9 +36,9 @@ Behaviour shared by all SDKs: [`docs/sdk-contract.md`](./docs/sdk-contract.md).
   fast tests; reports the platform `unknown`).
 - Dependencies: `kotlinx-coroutines-core` and `kotlinx-serialization-json` (plus
   `kotlinx-coroutines-android` on Android). HTTP uses the platform clients — `HttpURLConnection`
-  and `NSURLSession` — behind the small `HttpTransport` interface: two GET/POST calls do not
+  and `NSURLSession` — behind the small `HttpTransport` interface: three GET/POST calls do not
   justify shipping Ktor and an engine per platform into every app.
-- **Early release (0.1.x)**: covered by unit tests on the JVM, Android host tests and the iOS simulator. **Not verified on
+- **Early release (0.2.x)**: covered by unit tests on the JVM, Android host tests and the iOS simulator. **Not verified on
   a physical device.**
 - Deferred deep linking is not supported.
 
@@ -40,7 +50,7 @@ The library is on Maven Central. In your shared module:
 kotlin {
     sourceSets {
         commonMain.dependencies {
-            api("com.strybok:strybok-kmp:0.1.0")
+            api("com.strybok:strybok-kmp:0.2.0")
         }
     }
 }

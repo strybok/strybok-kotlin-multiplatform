@@ -74,7 +74,13 @@ internal object HttpUrlConnectionTransport : HttpTransport {
         val status = connection.responseCode
         val stream: InputStream? = if (status >= 400) connection.errorStream else connection.inputStream
         val body = stream?.use { readLimited(it) } ?: ""
-        return HttpResponse(status, body)
+        val headers = buildMap {
+            // The status line is listed under a null name.
+            connection.headerFields.forEach { (name, values) ->
+                if (name != null && values != null) put(name, values.joinToString(", "))
+            }
+        }
+        return HttpResponse(status, body, headers)
     }
 
     private fun readLimited(stream: InputStream): String {

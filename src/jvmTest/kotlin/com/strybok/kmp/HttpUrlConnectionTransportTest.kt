@@ -47,6 +47,15 @@ class HttpUrlConnectionTransportTest {
             when (exchange.requestURI.path) {
                 "/v1/public/resolve" -> exchange.reply(200, """{"linkId":"link_1","appId":"app_1","routePath":"/invite/café","payload":{"n":1}}""")
                 "/v1/public/events" -> exchange.reply(202, "")
+                "/v1/public/links" -> exchange.reply(
+                    201,
+                    """{"linkId":"link_9","url":"https://$HOST/Ab3dE9x","slug":"Ab3dE9x","routePath":"/product/é"}""",
+                )
+                "/limited/v1/public/links" -> exchange.reply(
+                    429,
+                    """{"error":{"code":"RATE_LIMITED","message":"Too many requests. Please retry in a minute.","details":{}}}""",
+                    mapOf("Retry-After" to "60"),
+                )
                 "/missing" -> exchange.reply(404, """{"error":"nope"}""")
                 "/slow" -> {
                     Thread.sleep(3_000)
@@ -61,8 +70,9 @@ class HttpUrlConnectionTransportTest {
     @AfterTest
     fun stopServer() = server.stop(0)
 
-    private fun HttpExchange.reply(status: Int, body: String) {
+    private fun HttpExchange.reply(status: Int, body: String, headers: Map<String, String> = emptyMap()) {
         val bytes = body.toByteArray(Charsets.UTF_8)
+        headers.forEach { (name, value) -> responseHeaders.add(name, value) }
         sendResponseHeaders(status, if (bytes.isEmpty()) -1 else bytes.size.toLong())
         if (bytes.isNotEmpty()) responseBody.use { it.write(bytes) }
         close()
@@ -97,6 +107,63 @@ class HttpUrlConnectionTransportTest {
         assertEquals("POST", recorded.method)
         assertEquals("""{"type":"app_open","x":"é"}""", recorded.body)
         assertEquals("application/json", recorded.headers["content-type"])
+    }
+
+    @Test
+    fun postSendsTheClientKeyHeaderAndResponseHeadersAreReturned() = runBlocking {
+        val headers = mapOf(
+            "Content-Type" to "application/json",
+            "Accept" to "application/json",
+            "X-Strybok-Key" to CLIENT_KEY,
+        )
+        val body = """{"routePath":"/product/é"}"""
+        val created = HttpUrlConnectionTransport.execute(
+            HttpRequest("POST", "$base/v1/public/links", headers, body, 5.seconds),
+        )
+        assertEquals(201, created.statusCode)
+        assertTrue("/product/é" in created.body)
+        val recorded = requests.single()
+        assertEquals("POST", recorded.method)
+        assertEquals(CLIENT_KEY, recorded.headers["x-strybok-key"])
+        assertEquals("application/json", recorded.headers["content-type"])
+        assertEquals("application/json", recorded.headers["accept"])
+        assertNull(recorded.headers["authorization"])
+        assertEquals(body, recorded.body)
+
+        val limited = HttpUrlConnectionTransport.execute(
+            HttpRequest("POST", "$base/limited/v1/public/links", headers, body, 5.seconds),
+        )
+        assertEquals(429, limited.statusCode)
+        assertEquals("60", limited.header("retry-after"))
+        assertEquals("60", limited.header("Retry-After"))
+        assertNull(limited.header("X-Missing"))
+        assertTrue("RATE_LIMITED" in limited.body)
+    }
+
+    @Test
+    fun createLinkEndToEndWithDefaultTransportAndRealTime(): Unit = runBlocking {
+        val sdk = Strybok(apiBaseUrl = "$base/", allowedHosts = setOf(HOST), clientKey = CLIENT_KEY)
+        val limited = Strybok(apiBaseUrl = "$base/limited", allowedHosts = setOf(HOST), clientKey = CLIENT_KEY)
+        try {
+            withTimeout(10.seconds) {
+                val link = sdk.createLink("/product/é", mapOf("name" to "café"), title = "Red shoes")
+                assertEquals("https://$HOST/Ab3dE9x", link.url)
+                assertEquals("Ab3dE9x", link.slug)
+                assertEquals("/product/é", link.routePath)
+                assertEquals("link_9", link.linkId)
+
+                val error = assertFailsWith<StrybokRateLimitedException> { limited.createLink("/product/é") }
+                assertEquals(60L, error.retryAfterSeconds)
+            }
+            assertEquals(2, requests.size, "429 is not retried")
+            val request = requests.first()
+            assertEquals("/v1/public/links", request.path)
+            assertEquals(CLIENT_KEY, request.headers["x-strybok-key"])
+            assertEquals("""{"routePath":"/product/é","payload":{"name":"café"},"title":"Red shoes"}""", request.body)
+        } finally {
+            sdk.dispose()
+            limited.dispose()
+        }
     }
 
     @Test

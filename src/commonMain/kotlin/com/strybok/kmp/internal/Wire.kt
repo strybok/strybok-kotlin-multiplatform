@@ -1,6 +1,8 @@
 package com.strybok.kmp.internal
 
+import com.strybok.kmp.CreatedLink
 import com.strybok.kmp.ResolvedDeepLink
+import com.strybok.kmp.StrybokValidationIssue
 import kotlin.uuid.Uuid
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -58,3 +60,93 @@ internal fun appOpenEventBody(linkId: String, platform: String, sdkVersion: Stri
         put("platform", platform)
         put("sdkVersion", sdkVersion.take(32))
     }.toString()
+
+/** A payload value that JSON cannot express. The message never quotes payload content. */
+internal class NotJsonException(message: String) : Exception(message)
+
+private const val MAX_PAYLOAD_DEPTH = 64
+
+/**
+ * Body of `POST /v1/public/links`. Arguments that were not given are left out: the API rejects
+ * unknown fields, and SDKs do not send `null`.
+ *
+ * @throws NotJsonException when [payload] holds something that is not plain JSON data.
+ */
+internal fun createLinkBody(
+    routePath: String,
+    payload: Map<String, Any?>?,
+    title: String?,
+    description: String?,
+    imageUrl: String?,
+): String = buildJsonObject {
+    put("routePath", routePath)
+    if (payload != null) put("payload", payload.toJsonElement(0))
+    if (title != null) put("title", title)
+    if (description != null) put("description", description)
+    if (imageUrl != null) put("imageUrl", imageUrl)
+}.toString()
+
+private fun Any?.toJsonElement(depth: Int): JsonElement {
+    if (depth > MAX_PAYLOAD_DEPTH) throw NotJsonException("payload is nested too deeply")
+    return when (this) {
+        null -> JsonNull
+        is JsonElement -> this
+        is String -> JsonPrimitive(this)
+        is Boolean -> JsonPrimitive(this)
+        is Int, is Long, is Short, is Byte -> JsonPrimitive(this as Number)
+        is Double -> if (isFinite()) JsonPrimitive(this) else throw notFinite()
+        is Float -> if (isFinite()) JsonPrimitive(this) else throw notFinite()
+        is Map<*, *> -> JsonObject(
+            buildMap {
+                this@toJsonElement.forEach { (key, value) ->
+                    if (key !is String) throw NotJsonException("payload contains a map whose keys are not strings")
+                    put(key, value.toJsonElement(depth + 1))
+                }
+            },
+        )
+        is Iterable<*> -> JsonArray(map { it.toJsonElement(depth + 1) })
+        is Array<*> -> JsonArray(map { it.toJsonElement(depth + 1) })
+        else -> throw NotJsonException(
+            "payload contains a value that is not JSON data (${this::class.simpleName}); " +
+                "use strings, booleans, numbers, null, lists and maps with string keys",
+        )
+    }
+}
+
+private fun notFinite() = NotJsonException("payload contains a number that is not finite")
+
+/** Parses a 200/201 create-link response; `null` unless it has everything a created link needs. */
+internal fun parseCreateLinkResponse(body: String): CreatedLink? {
+    val json = parseObject(body) ?: return null
+    val url = json.string("url") ?: return null
+    if (!url.startsWith("https://", ignoreCase = true)) return null
+    return CreatedLink(
+        url = url,
+        slug = json.string("slug") ?: return null,
+        routePath = json.string("routePath") ?: return null,
+        linkId = json.string("linkId") ?: return null,
+    )
+}
+
+/** `error.message` and `error.details.issues` of an error answer, as far as they are present. */
+internal fun parseValidationError(body: String): Pair<String?, List<StrybokValidationIssue>> {
+    val error = parseObject(body)?.get("error") as? JsonObject ?: return null to emptyList()
+    val issues = ((error["details"] as? JsonObject)?.get("issues") as? JsonArray).orEmpty().mapNotNull { issue ->
+        val message = (issue as? JsonObject)?.string("message") ?: return@mapNotNull null
+        StrybokValidationIssue(issue.string("path") ?: "", message)
+    }
+    return error.string("message")?.takeIf { it.isNotBlank() } to issues
+}
+
+/** Seconds from a `Retry-After` header; `null` when it is missing or not a number of seconds. */
+internal fun parseRetryAfterSeconds(header: String?): Long? {
+    val value = header?.trim().orEmpty()
+    if (value.isEmpty() || !value.all { it in '0'..'9' }) return null
+    return value.toLongOrNull()
+}
+
+private fun parseObject(body: String): JsonObject? = try {
+    Json.parseToJsonElement(body) as? JsonObject
+} catch (_: IllegalArgumentException) { // SerializationException
+    null
+}

@@ -25,7 +25,19 @@ public class HttpResponse(
     public val statusCode: Int,
     /** Response body decoded as UTF-8; empty when there is none. */
     public val body: String,
-)
+    /**
+     * Response headers. The SDK only reads `Retry-After` (for [Strybok.createLink]) and looks
+     * names up case-insensitively, so a transport may leave this empty.
+     */
+    public val headers: Map<String, String>,
+) {
+    /** A response without headers. */
+    public constructor(statusCode: Int, body: String) : this(statusCode, body, emptyMap())
+
+    /** The value of the header [name], compared case-insensitively; `null` when absent. */
+    public fun header(name: String): String? =
+        headers.entries.firstOrNull { it.key.equals(name, ignoreCase = true) }?.value
+}
 
 /**
  * Performs HTTP calls for the SDK. The default implementation uses `HttpURLConnection` on

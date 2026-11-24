@@ -8,7 +8,7 @@ plugins {
 }
 
 group = "com.strybok"
-version = "0.1.0"
+version = "0.2.0"
 
 val coroutinesVersion = "1.10.2"
 val serializationVersion = "1.9.0"
