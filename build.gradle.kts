@@ -8,13 +8,15 @@ plugins {
 }
 
 group = "com.strybok"
-version = "0.3.0"
+version = "0.4.0"
 
 val coroutinesVersion = "1.10.2"
 val serializationVersion = "1.9.0"
 
 kotlin {
     explicitApi()
+    // `PlatformContext` is an expect class (android.content.Context on Android).
+    compilerOptions { freeCompilerArgs.add("-Xexpect-actual-classes") }
 
     jvm {
         compilerOptions { jvmTarget.set(JvmTarget.JVM_11) }
@@ -68,6 +70,10 @@ kotlin {
             // artifact does not depend on Google's libraries. An app that wants attestation on
             // Android adds the library itself.
             compileOnly("com.google.android.play:integrity:1.4.0")
+            // Only the install referrer sources of deferred links use these two, and only to
+            // compile: an app that wants a source adds its store's library itself.
+            compileOnly("com.android.installreferrer:installreferrer:2.2")
+            compileOnly("store.galaxy.samsung.installreferrer:samsung_galaxystore_install_referrer:4.0.0")
         }
     }
 }

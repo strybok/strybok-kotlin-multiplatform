@@ -1,3 +1,66 @@
+## 0.4.0
+
+- Campaign values. `ResolvedDeepLink.campaign` (`LinkCampaign`: `source`, `medium`, `campaign`,
+  `term`, `content`, each `String?`; `isEmpty`; `LinkCampaign.EMPTY`) holds the link's default
+  campaign values overridden by the `utm_*` parameters of the tapped URL, as the service returned
+  them. It is never `null`. The values are untrusted labels chosen by whoever shared the link.
+- The resolve request now carries the five parameters `utm_source`, `utm_medium`, `utm_campaign`,
+  `utm_term` and `utm_content` of the tapped URL — exact lower-case names, the first occurrence
+  of each, percent-decoded, and only values of 1–64 characters out of `A–Z a–z 0–9 . _ ~ -`, in
+  a fixed order. Every other query parameter and the fragment are still never sent, and a URL
+  without valid campaign parameters produces exactly the request of earlier versions. The filter
+  is common code, identical on Android, iOS and the JVM.
+- The `app_open` event reports `campaign` exactly as resolve returned it and leaves it out when
+  there is none; it is never built from the URL.
+- Which URLs are accepted, duplicate detection (the whole URL string as received) and everything
+  else are unchanged.
+- Deferred links, optional and off by default: restore a link that was tapped before the app was
+  installed. New constructor arguments `deferredLinks`, `installReferrerSources`,
+  `allowProbabilisticMatching` and `platformContext`; `enableDeferredLinks()` switches the
+  option on later, for example after a consent screen. A deferred link is delivered through the
+  normal pipeline with the new `ResolvedDeepLink.isDeferred` set, never from `getInitialLink`,
+  without an `app_open` event, and nothing about it is reported to `onError`. The flows are
+  common code; the JVM target ignores the options.
+- Android: after the first `start()` the SDK asks the stores for their install referrer,
+  exchanges the click id found in it (`POST /v1/public/deferred-links/redeem`: the id, the
+  package name and the SDK version, nothing else) and delivers the link. A normal link of the
+  app that arrives first — also while the request is in flight — wins. At most once per
+  installation: `attempts` and `done` are kept in the app's no-backup storage, an attempt is
+  counted before a source is asked, three launches are the limit, `done` is stored before
+  delivery, and an app that was updated since it was installed is not asked. Needs
+  `platformContext` (the new `PlatformContext` type, which is `android.content.Context` on
+  Android).
+- Android sources, **without a new dependency**: `InstallReferrerSource` is a one-function
+  interface (`InstallReferrerResult.Referrer`, `UnavailableForNow`, `Unavailable`).
+  `PlayInstallReferrerSource` and `GalaxyStoreInstallReferrerSource` are compiled against
+  `com.android.installreferrer:installreferrer` and
+  `store.galaxy.samsung.installreferrer:samsung_galaxystore_install_referrer` with
+  `compileOnly`; `AppGalleryInstallReferrerSource` queries AppGallery's content provider and
+  needs no library. An app adds the library of each store it uses; a source whose library is
+  missing answers "unavailable". The consumer R8 rules cover the missing classes.
+- iOS, flow A: `redeemPastedLink(text)` takes a string the person pasted and answers with a
+  `PastedLinkResult` (`DELIVERED`, `NOT_OURS`, `NOT_FOUND`, `ALREADY_HANDLED`, `DISABLED`,
+  `FAILED`). **The SDK never reads the pasteboard**; only the click id, the bundle identifier
+  and the SDK version are sent, and a string that is not a copied link of the app is dropped
+  without a request. `pasteboardMayContainLink()` uses `UIPasteboard.detectPatterns`, which
+  hands over no content. A test of the SDK fails when any content-reading pasteboard call
+  appears in the iOS sources.
+- iOS, flow B, only with `allowProbabilisticMatching` in addition to `deferredLinks`: on the
+  first launch the service is asked to guess the link (`POST /v1/public/deferred-links/match`:
+  bundle identifier, device family, first preferred language, SDK version, nothing else). **This
+  is fingerprinting in Apple's terms and forbidden by the App Store Review Guidelines**; it is
+  off by default and not recommended. Such a link has `ResolvedDeepLink.isProbabilisticMatch`
+  set and can be another person's. While the pasteboard may hold a link the SDK waits
+  (`AWAITING_PASTE`) for `redeemPastedLink` or the new `skipPastedLink()`.
+- `deferredLinkStatus` (`StateFlow<DeferredLinkStatus>`: `DISABLED`, `CHECKING`, `PENDING`,
+  `AWAITING_PASTE`, `NOT_FIRST_LAUNCH`, `UNAVAILABLE`, `NO_REFERRER`, `NOT_FOUND`, `SUPERSEDED`,
+  `DELIVERED`, `FAILED`; `isFinal`) and `addDeferredLinkStatusListener` for Swift. Swift also
+  gets the constructor
+  `Strybok(apiBaseUrl:allowedHosts:clientKey:attestation:deferredLinks:allowProbabilisticMatching:onError:)`.
+- Not verified: nothing of deferred links has run on a device, against a real store or with a
+  real pasteboard. The Galaxy Store and AppGallery sources are unverified altogether; the
+  manifest entries AppGallery may need are documented, not added.
+
 ## 0.3.0
 
 - Optional attestation of `createLink` ("Extra protection"), off by default: with

@@ -28,6 +28,18 @@ val link = strybok.createLink("/product/42", payload = mapOf("productId" to 42),
 share(link.url)
 ```
 
+Campaign values (`utm_source`, `utm_medium`, `utm_campaign`, `utm_term`, `utm_content`) of the
+open come with the link:
+
+```kotlin
+strybok.links.collect { link -> link.campaign.source?.let { analytics.label("source", it) } }
+```
+
+Campaign values are the link's defaults (set in the dashboard) overridden by the `utm_*`
+parameters of the tapped URL. They are labels chosen by whoever shared the link: use them for
+your analytics, never to decide anything. Details:
+[integration guide](./docs/kotlin-multiplatform.md#campaign-values).
+
 ### Extra protection (optional)
 
 The publishable key can be copied out of an app. The owner of the application can therefore ask
@@ -73,6 +85,62 @@ Limits you should know:
 - **It has never run against Apple's or Google's real services or on a physical device** — only
   against fakes in unit tests. Treat the **Required** mode as experimental.
 
+### Deferred links (optional)
+
+Restoring a link that was tapped before the app was installed. **Off by default**, and very
+different per platform:
+
+- **Android — automatic.** The store's install referrer carries a code; the SDK exchanges it
+  and delivers the link about a second after the first start. Switch on **Restore the link
+  after install** in the dashboard, add the store's library to the Android app and pass the
+  application context and the sources:
+
+  ```kotlin
+  val strybok = Strybok(
+      apiBaseUrl = "https://api.strybok.com",
+      allowedHosts = setOf("my-app.strybok.link"),
+      deferredLinks = true,
+      // Android only, created in Android code; empty and null elsewhere:
+      // listOf(PlayInstallReferrerSource(applicationContext)) and applicationContext
+      installReferrerSources = installReferrerSources,
+      platformContext = platformContext,
+  )
+  ```
+
+  | Source                             | Store                | Add to the Android app                                                            | Standing                                     |
+  | ---------------------------------- | -------------------- | --------------------------------------------------------------------------------- | -------------------------------------------- |
+  | `PlayInstallReferrerSource`        | Google Play          | `com.android.installreferrer:installreferrer:2.2`                                 | From Google's documentation; not on a device |
+  | `GalaxyStoreInstallReferrerSource` | Samsung Galaxy Store | `store.galaxy.samsung.installreferrer:samsung_galaxystore_install_referrer:4.0.0` | **Unverified**                               |
+  | `AppGalleryInstallReferrerSource`  | Huawei AppGallery    | No library; possibly manifest entries, see the guide                              | **Unverified**                               |
+
+- **iOS — nothing automatic that Apple allows.** Two opt-in flows, each with a cost, described
+  in [`docs/ios.md`](./docs/ios.md#links-tapped-before-the-app-is-installed):
+  - **The person pastes the link.** A page before the App Store offers "Copy link and get the
+    app"; your app shows a paste button and calls `strybok.redeemPastedLink(text)`. **The SDK
+    never reads the pasteboard.** Cost: an extra page and tap for every iOS visitor without the
+    app, and it works only for people who copy and later paste.
+  - **Probabilistic matching** (`allowProbabilisticMatching = true`): the service guesses from
+    the network address. **Forbidden by Apple's rules (fingerprinting), often wrong or
+    impossible, and a match can be another person's link** — check
+    `link.isProbabilisticMatch` before doing anything that matters. Not recommended.
+- **JVM:** the options are ignored.
+
+A deferred link arrives on `links` with `isDeferred == true`, never from `getInitialLink()`. If
+your app asks for consent first, leave `deferredLinks` off and call
+`strybok.enableDeferredLinks()` afterwards. `strybok.deferredLinkStatus` tells developers and QA
+what happened; nothing is reported to `onError`.
+
+The limits, plainly:
+
+- Android: only when the app is installed **from the store page the link sent the person to**
+  (not after a search, not from the store's website, not from an APK), **within 24 hours**, once.
+- **Huawei AppGallery and Samsung Galaxy Store were never verified**, not even that those stores
+  pass the value on.
+- **None of it has run on a device, against a real store or with a real pasteboard** — only
+  against fakes in unit tests.
+
+Full guide: [`docs/kotlin-multiplatform.md`](./docs/kotlin-multiplatform.md#12-deferred-links-optional).
+
 Full guide, native setup and troubleshooting:
 [`docs/kotlin-multiplatform.md`](./docs/kotlin-multiplatform.md).
 Behaviour shared by all SDKs: [`docs/sdk-contract.md`](./docs/sdk-contract.md).
@@ -83,10 +151,13 @@ Behaviour shared by all SDKs: [`docs/sdk-contract.md`](./docs/sdk-contract.md).
   `kotlinx-coroutines-android` on Android). HTTP uses the platform clients — `HttpURLConnection`
   and `NSURLSession` — behind the small `HttpTransport` interface: three GET/POST calls do not
   justify shipping Ktor and an engine per platform into every app. Google's Play Integrity
-  library is not a dependency; only Android apps that switch attestation on add it.
-- **Early release (0.3.x)**: covered by unit tests on the JVM, Android host tests and the iOS simulator. **Not verified on
+  library and the stores' install referrer libraries are not dependencies; only Android apps
+  that switch attestation or deferred links on add them.
+- **Early release (0.4.x)**: covered by unit tests on the JVM, Android host tests and the iOS simulator. **Not verified on
   a physical device.**
-- Deferred deep linking is not supported.
+- Restoring a link after installation ("deferred links") is optional and off by default:
+  automatic on Android, and on iOS only a paste step or a guess that Apple forbids — there is no
+  automatic restore on iOS. See above.
 
 ## Install
 
@@ -96,7 +167,7 @@ The library is on Maven Central. In your shared module:
 kotlin {
     sourceSets {
         commonMain.dependencies {
-            api("com.strybok:strybok-kmp:0.3.0")
+            api("com.strybok:strybok-kmp:0.4.0")
         }
     }
 }

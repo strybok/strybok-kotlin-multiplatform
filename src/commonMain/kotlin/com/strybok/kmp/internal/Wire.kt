@@ -1,6 +1,7 @@
 package com.strybok.kmp.internal
 
 import com.strybok.kmp.CreatedLink
+import com.strybok.kmp.LinkCampaign
 import com.strybok.kmp.ResolvedDeepLink
 import com.strybok.kmp.StrybokValidationIssue
 import kotlin.uuid.Uuid
@@ -19,7 +20,12 @@ import kotlinx.serialization.json.put
 private val emptyPayload = JsonObject(emptyMap())
 
 /** Parses a 200 resolve response; `null` when it is malformed or its route is unsafe. */
-internal fun parseResolveResponse(url: String, body: String): ResolvedDeepLink? {
+internal fun parseResolveResponse(
+    url: String,
+    body: String,
+    isDeferred: Boolean = false,
+    isProbabilisticMatch: Boolean = false,
+): ResolvedDeepLink? {
     val json = try {
         Json.parseToJsonElement(body)
     } catch (_: IllegalArgumentException) { // SerializationException
@@ -38,7 +44,39 @@ internal fun parseResolveResponse(url: String, body: String): ResolvedDeepLink? 
         routePath = routePath,
         payload = payload.mapValues { it.value.toPlainValue() },
         payloadJson = payload.toString(),
+        campaign = parseCampaign(json["campaign"]),
+        isDeferred = isDeferred,
+        isProbabilisticMatch = isProbabilisticMatch,
     )
+}
+
+/**
+ * Parses a 200 answer of the redeem or match endpoint: `deferred` must be `true`, `url` a link
+ * of this app, the rest as for resolving; with [probabilistic] also `matched` =
+ * `"probabilistic"`. `null` for anything else. Unknown fields are ignored.
+ */
+internal fun parseDeferredResponse(body: String, allowedHosts: Set<String>, probabilistic: Boolean): ResolvedDeepLink? {
+    val json = parseObject(body) ?: return null
+    val deferred = (json["deferred"] as? JsonPrimitive)?.takeIf { !it.isString }?.booleanOrNull
+    if (deferred != true) return null
+    if (probabilistic && json.string("matched") != "probabilistic") return null
+    val url = json.string("url") ?: return null
+    // An answer that points anywhere but at a link of this app is dropped.
+    if (parseLinkUrl(url, allowedHosts) == null) return null
+    return parseResolveResponse(url, body, isDeferred = true, isProbabilisticMatch = probabilistic)
+}
+
+/** Keeps the five string fields; anything else, or no object at all, is not an error. */
+private fun parseCampaign(json: JsonElement?): LinkCampaign {
+    if (json !is JsonObject) return LinkCampaign.EMPTY
+    val campaign = LinkCampaign(
+        source = json.string("source"),
+        medium = json.string("medium"),
+        campaign = json.string("campaign"),
+        term = json.string("term"),
+        content = json.string("content"),
+    )
+    return if (campaign.isEmpty) LinkCampaign.EMPTY else campaign
 }
 
 private fun JsonObject.string(key: String): String? =
@@ -51,14 +89,35 @@ private fun JsonElement.toPlainValue(): Any? = when (this) {
     is JsonObject -> mapValues { it.value.toPlainValue() }
 }
 
-/** Body of the `app_open` event. The API rejects any other field. */
-internal fun appOpenEventBody(linkId: String, platform: String, sdkVersion: String): String =
+/**
+ * Body of the `app_open` event. The API rejects any other field.
+ *
+ * [campaign] is what resolve returned, unchanged, and is left out when it is empty.
+ */
+internal fun appOpenEventBody(
+    linkId: String,
+    platform: String,
+    sdkVersion: String,
+    campaign: LinkCampaign = LinkCampaign.EMPTY,
+): String =
     buildJsonObject {
         put("eventId", Uuid.random().toString()) // Random UUID v4, lower-case.
         put("linkId", linkId)
         put("type", "app_open")
         put("platform", platform)
         put("sdkVersion", sdkVersion.take(32))
+        if (!campaign.isEmpty) {
+            put(
+                "campaign",
+                buildJsonObject {
+                    campaign.source?.let { put("source", it) }
+                    campaign.medium?.let { put("medium", it) }
+                    campaign.campaign?.let { put("campaign", it) }
+                    campaign.term?.let { put("term", it) }
+                    campaign.content?.let { put("content", it) }
+                },
+            )
+        }
     }.toString()
 
 /** A payload value that JSON cannot express. The message never quotes payload content. */

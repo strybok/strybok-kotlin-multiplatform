@@ -1,6 +1,7 @@
 package com.strybok.kmp
 
 import com.strybok.kmp.internal.Attestor
+import com.strybok.kmp.internal.DeferredSetup
 import com.strybok.kmp.testing.FakeLinkSource
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
@@ -39,8 +40,20 @@ class FakeApi(var onResolve: (suspend (HttpRequest) -> HttpResponse)? = null) : 
     var onEvent: (suspend () -> HttpResponse)? = null
     val creates = mutableListOf<HttpRequest>()
     var onCreate: (suspend (HttpRequest) -> HttpResponse)? = null
+    val redeems = mutableListOf<HttpRequest>()
+    var onRedeem: (suspend (HttpRequest) -> HttpResponse)? = null
+    val matches = mutableListOf<HttpRequest>()
+    var onMatch: (suspend (HttpRequest) -> HttpResponse)? = null
 
     override suspend fun execute(request: HttpRequest): HttpResponse {
+        if (request.url.endsWith("/v1/public/deferred-links/redeem")) {
+            redeems += request
+            return onRedeem?.invoke(request) ?: redeemed()
+        }
+        if (request.url.endsWith("/v1/public/deferred-links/match")) {
+            matches += request
+            return onMatch?.invoke(request) ?: redeemed(matched = true)
+        }
         if (request.url.endsWith("/v1/public/events")) {
             eventRequests += request
             events += Json.parseToJsonElement(request.body!!).jsonObject
@@ -70,6 +83,7 @@ internal fun TestScope.sdk(
     clientKey: String? = CLIENT_KEY,
     attestor: Attestor? = null,
     wallClock: () -> Instant = { wallClockOf(this) },
+    deferred: DeferredSetup = DeferredSetup(),
 ): Strybok = Strybok(
     apiBaseUrl = apiBaseUrl,
     allowedHosts = allowedHosts,
@@ -86,6 +100,7 @@ internal fun TestScope.sdk(
     clientKey = clientKey,
     attestor = attestor,
     wallClock = wallClock,
+    deferred = deferred,
 )
 
 /** 2026-11-24T10:00:00Z, the wall-clock time at which every test starts. */

@@ -4,10 +4,15 @@ import com.strybok.kmp.internal.appOpenEventBody
 import com.strybok.kmp.internal.AttestationApi
 import com.strybok.kmp.internal.AttestationSession
 import com.strybok.kmp.internal.Attestor
+import com.strybok.kmp.internal.DeferredLinks
+import com.strybok.kmp.internal.DeferredSetup
+import com.strybok.kmp.internal.DisposedException
 import com.strybok.kmp.internal.KEY_REFUSED_MESSAGE
 import com.strybok.kmp.internal.NotJsonException
 import com.strybok.kmp.internal.asciiLowercase
 import com.strybok.kmp.internal.createLinkBody
+import com.strybok.kmp.internal.deferredNeedsContext
+import com.strybok.kmp.internal.deferredSetup
 import com.strybok.kmp.internal.normalizeApiBaseUrl
 import com.strybok.kmp.internal.parseCreateLinkResponse
 import com.strybok.kmp.internal.parseAttestationError
@@ -20,6 +25,7 @@ import com.strybok.kmp.internal.platformAttestor
 import com.strybok.kmp.internal.platformCoroutineContext
 import com.strybok.kmp.internal.platformHttpTransport
 import com.strybok.kmp.internal.platformName
+import kotlin.concurrent.atomics.AtomicBoolean
 import kotlin.concurrent.atomics.AtomicReference
 import kotlin.coroutines.CoroutineContext
 import kotlin.coroutines.cancellation.CancellationException
@@ -41,13 +47,14 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 
 /** Version reported with analytics events. */
-public const val STRYBOK_SDK_VERSION: String = "0.3.0"
+public const val STRYBOK_SDK_VERSION: String = "0.4.0"
 
 /** Returned by [Strybok.addListener]; call [cancel] to stop receiving links. */
 public fun interface Subscription {
@@ -68,6 +75,10 @@ public fun interface Subscription {
  *
  * Every resolved link is delivered exactly once. [createLink] makes a link to share; it needs
  * a `clientKey` and is independent of incoming links. The class is thread-safe.
+ *
+ * Restoring a link after the app was installed ("deferred links") is optional and off by
+ * default; see the `deferredLinks` argument, [enableDeferredLinks] and, on iOS,
+ * [redeemPastedLink].
  */
 public class Strybok internal constructor(
     apiBaseUrl: String,
@@ -92,6 +103,8 @@ public class Strybok internal constructor(
     private val attestor: Attestor? = null,
     /** Wall clock; only compared with the expiry of an attestation token. */
     private val wallClock: () -> Instant = { Clock.System.now() },
+    /** Deferred links: off, and without a platform, unless the public constructor says otherwise. */
+    deferred: DeferredSetup = DeferredSetup(),
 ) {
     /**
      * @param apiBaseUrl base URL of the API, e.g. `https://api.strybok.com`; a path prefix is kept.
@@ -117,6 +130,29 @@ public class Strybok internal constructor(
      *   [attestation] is on, usually a `PlayIntegrityTokenProvider`. `null` — for example in a
      *   build for a market without Google Play — means the Android app cannot attest: links are
      *   requested without a proof and the service decides. Ignored on iOS and the JVM.
+     * @param deferredLinks restore a link that was tapped before the app was installed, off by
+     *   default. **Android:** on the first launch the SDK asks [installReferrerSources] for the
+     *   store's install referrer and, when it carries a click id of the service, delivers that
+     *   link like any other; needs [platformContext]. **iOS:** enables [redeemPastedLink] — the
+     *   SDK itself does nothing until the app hands over a string the person pasted — and, only
+     *   together with [allowProbabilisticMatching], the automatic guess. Ignored on the JVM.
+     *   With `false` nothing is read, sent or stored. Reading a referrer is access to
+     *   information stored on the device: if the app asks for consent first, leave this `false`
+     *   and call [enableDeferredLinks] afterwards.
+     * @param installReferrerSources Android only: the stores to ask when [deferredLinks] is on,
+     *   in this order, e.g. `listOf(PlayInstallReferrerSource(context))`. Empty means the check
+     *   ends at once with [DeferredLinkStatus.UNAVAILABLE].
+     * @param allowProbabilisticMatching iOS only, and only together with [deferredLinks]: on the
+     *   first launch let the service **guess** which link the person tapped, from the network
+     *   address of the device, its family (iPhone, iPad, iPod) and its first language. **This
+     *   is fingerprinting in Apple's terms: the App Store Review Guidelines and the Apple
+     *   Developer Program License Agreement forbid deriving data from a device to identify it,
+     *   with or without the user's consent.** A match is a guess and can be another person's
+     *   link — see [ResolvedDeepLink.isProbabilisticMatch]. Off by default; not recommended.
+     * @param platformContext Android only: the application `Context`, needed when
+     *   [deferredLinks] is (or will be) switched on. `null` on iOS and the JVM.
+     * @throws IllegalArgumentException when a value is out of range, or when [deferredLinks] is
+     *   on for Android without a [platformContext].
      */
     public constructor(
         apiBaseUrl: String,
@@ -133,10 +169,15 @@ public class Strybok internal constructor(
         clientKey: String? = null,
         attestation: Boolean = false,
         integrityTokenProvider: IntegrityTokenProvider? = null,
+        deferredLinks: Boolean = false,
+        installReferrerSources: List<InstallReferrerSource> = emptyList(),
+        allowProbabilisticMatching: Boolean = false,
+        platformContext: PlatformContext? = null,
     ) : this(
         apiBaseUrl, allowedHosts, timeout, maxRetries, retryDelay, dedupeWindow, reportAppOpens,
         onError, linkSource, transport, coroutineContext, TimeSource.Monotonic, clientKey,
         if (attestation) platformAttestor(integrityTokenProvider) else null,
+        deferred = deferredSetup(deferredLinks, installReferrerSources, allowProbabilisticMatching, platformContext),
     )
 
     /** All defaults; convenient from Swift, where Kotlin default arguments are not available. */
@@ -169,6 +210,25 @@ public class Strybok internal constructor(
         attestation = attestation,
     )
 
+    /**
+     * All defaults plus the switches of [createLink] and of deferred links; convenient from
+     * Swift. [allowProbabilisticMatching] is forbidden by Apple's rules — read the constructor
+     * with all arguments before passing `true`.
+     */
+    public constructor(
+        apiBaseUrl: String,
+        allowedHosts: Set<String>,
+        clientKey: String?,
+        attestation: Boolean,
+        deferredLinks: Boolean,
+        allowProbabilisticMatching: Boolean,
+        onError: ((StrybokException) -> Unit)?,
+    ) : this(
+        apiBaseUrl, allowedHosts, timeout = 5.seconds, onError = onError, clientKey = clientKey,
+        attestation = attestation, deferredLinks = deferredLinks,
+        allowProbabilisticMatching = allowProbabilisticMatching,
+    )
+
     init {
         require(maxRetries >= 0) { "maxRetries must not be negative" }
         require(timeout.isPositive()) { "timeout must be positive" }
@@ -195,14 +255,26 @@ public class Strybok internal constructor(
 
     private class Seen(val url: String, val at: ComparableTimeMark)
 
-    private class DisposedException : IllegalStateException("Strybok has been disposed")
-
     private val scope = CoroutineScope(SupervisorJob() + coroutineContext)
     private val state = AtomicReference(State())
     private val lastSeen = AtomicReference<Seen?>(null)
 
     /** Created by the first [createLink] that needs it; never by [start] or an incoming link. */
     private val attestation = AtomicReference<AttestationSession?>(null)
+
+    /** Whether a link of this app was accepted since the process started; a deferred link then loses. */
+    private val normalLinkAccepted = AtomicBoolean(false)
+
+    private val deferredLinks = DeferredLinks(
+        setup = deferred,
+        scope = scope,
+        allowedHosts = this.allowedHosts,
+        sdkVersion = STRYBOK_SDK_VERSION,
+        post = ::postDeferred,
+        normalLinkAccepted = { normalLinkAccepted.load() },
+        // Like any other link, but it is never the launch link and no `app_open` is reported.
+        deliver = { link -> deliver(link, isInitial = false) },
+    )
 
     private val startJob: Deferred<Unit> = scope.async(start = CoroutineStart.LAZY) {
         // Listen first so a link arriving during start-up is not missed. Undispatched: the
@@ -220,6 +292,8 @@ public class Strybok internal constructor(
             null // The platform could not tell us; treat as "no launch link".
         }
         if (initial != null && accept(initial)) process(initial, isInitial = true)
+        // Everything `start` does is done; the deferred-link check is a coroutine of its own.
+        deferredLinks.onStarted()
     }
 
     /**
@@ -333,7 +407,8 @@ public class Strybok internal constructor(
             ?: throw UnsupportedLinkException("Not a link for this app", url)
         val request = HttpRequest(
             method = "GET",
-            // Query and fragment are not needed for the lookup and may hold private data.
+            // Of the query only the campaign parameters are sent; the rest and the fragment
+            // may hold private data.
             url = "$apiBaseUrl/v1/public/resolve?url=${percentEncode(link.lookup)}",
             headers = mapOf("Accept" to "application/json"),
             body = null,
@@ -491,6 +566,102 @@ public class Strybok internal constructor(
     public suspend fun createLink(routePath: String): CreatedLink =
         createLink(routePath, null, null, null, null)
 
+    // --- Deferred links -----------------------------------------------------------------------
+
+    /**
+     * Where the deferred-link check stands: `value` is readable at any time and the flow is
+     * observable. For developers and QA; apps do not need it to receive the link. Nothing
+     * about deferred links is ever reported to `onError`.
+     */
+    public val deferredLinkStatus: StateFlow<DeferredLinkStatus> get() = deferredLinks.status
+
+    /**
+     * Callback alternative to collecting [deferredLinkStatus] (handy from Swift). [listener]
+     * gets the current status first and later ones as they come, on the SDK's coroutine context.
+     */
+    public fun addDeferredLinkStatusListener(listener: (DeferredLinkStatus) -> Unit): Subscription {
+        if (state.load().disposed) return Subscription { }
+        val job = scope.launch { deferredLinks.status.collect { listener(it) } }
+        return Subscription { job.cancel() }
+    }
+
+    /**
+     * Switches deferred links on after the instance was created — for example once the person
+     * agreed on a consent screen — and runs the automatic check once, after [start]. Does
+     * nothing when the option was already on, on the JVM, or after [dispose].
+     *
+     * The check never delays [start], the launch link, [getInitialLink] or [createLink].
+     *
+     * @throws IllegalStateException on Android when no `platformContext` was given.
+     */
+    @Throws(IllegalStateException::class)
+    public fun enableDeferredLinks() {
+        if (state.load().disposed) return
+        check(deferredLinks.isSupported || deferredNeedsContext == null) { deferredNeedsContext.orEmpty() }
+        deferredLinks.enable()
+    }
+
+    /**
+     * iOS: hands the SDK a string the person pasted — from Apple's `UIPasteControl` (iOS 16 or
+     * later; tapping it is the person's consent and shows no "Allow Paste" alert) or from a
+     * paste action of your own. **The SDK never reads the pasteboard itself.**
+     *
+     * When [text] is the link the person copied on the page before the App Store, the SDK
+     * exchanges the click id in it for the link and delivers it through [links] with
+     * [ResolvedDeepLink.isDeferred] set — even if a normal link was delivered earlier in this
+     * launch. Anything else is [PastedLinkResult.NOT_OURS]: no request is made and the string
+     * is dropped, not stored and not logged. Only the click id, the bundle identifier and the
+     * SDK version are ever sent, never the pasted text.
+     *
+     * Needs the `deferredLinks` option and "copy link" switched on for the application in the
+     * dashboard. On Android and the JVM it returns [PastedLinkResult.DISABLED].
+     *
+     * @throws IllegalStateException after [dispose].
+     */
+    @Throws(IllegalStateException::class, CancellationException::class)
+    public suspend fun redeemPastedLink(text: String): PastedLinkResult {
+        checkNotDisposed()
+        return deferredLinks.redeemPastedLink(text)
+    }
+
+    /**
+     * iOS: whether the pasteboard probably holds a web URL, so the app can decide whether to
+     * show its paste button. Uses `UIPasteboard.detectPatterns`, which answers without reading
+     * the content and without showing a banner or an alert. It cannot know whether the URL is
+     * a link of this app. `false` when the `deferredLinks` option is off, when a deferred link
+     * was already handled on this installation, and on Android and the JVM.
+     */
+    @Throws(CancellationException::class)
+    public suspend fun pasteboardMayContainLink(): Boolean =
+        !state.load().disposed && deferredLinks.pasteboardMayContainLink()
+
+    /**
+     * iOS, only with `allowProbabilisticMatching`: tells the SDK that the person moved on
+     * without pasting (they left the screen with the paste button). While
+     * [deferredLinkStatus] is [DeferredLinkStatus.AWAITING_PASTE] the SDK does not guess,
+     * because an exact answer may be one tap away; this call, or a [redeemPastedLink] that
+     * returns [PastedLinkResult.NOT_OURS], lets the matching start. Does nothing otherwise.
+     */
+    public fun skipPastedLink() {
+        if (!state.load().disposed) deferredLinks.skipPastedLink()
+    }
+
+    /** One deferred-link request with the usual retries; `null` when no answer below 500 came. */
+    private suspend fun postDeferred(path: String, body: String): HttpResponse? {
+        val request = HttpRequest(
+            method = "POST",
+            url = "$apiBaseUrl$path",
+            headers = mapOf("Content-Type" to "application/json", "Accept" to "application/json"),
+            body = body,
+            timeout = timeout,
+        )
+        return try {
+            send(request, null, "The deferred-link request timed out") { it }
+        } catch (_: StrybokException) {
+            null // Not reported anywhere: a later launch, or another tap on Paste, tries again.
+        }
+    }
+
     /**
      * Stops listening and releases resources: nothing is delivered afterwards, including a
      * link that was still resolving. The instance cannot be reused. Calling it again is harmless.
@@ -548,8 +719,11 @@ public class Strybok internal constructor(
         StrybokValidationException(message, listOf(StrybokValidationIssue(field, message)))
 
     /** Cheap, synchronous checks done in arrival order: ours, and not a duplicate delivery. */
-    private fun accept(url: String): Boolean =
-        !state.load().disposed && isStrybokLink(url) && !isDuplicate(url)
+    private fun accept(url: String): Boolean {
+        if (state.load().disposed || !isStrybokLink(url)) return false
+        normalLinkAccepted.store(true)
+        return !isDuplicate(url)
+    }
 
     /**
      * The OS (or the app) can hand over the same tap twice, e.g. as the launch link and again
@@ -640,7 +814,7 @@ public class Strybok internal constructor(
                 method = "POST",
                 url = "$apiBaseUrl/v1/public/events",
                 headers = mapOf("Content-Type" to "application/json"),
-                body = appOpenEventBody(link.linkId, platformName, STRYBOK_SDK_VERSION),
+                body = appOpenEventBody(link.linkId, platformName, STRYBOK_SDK_VERSION, link.campaign),
                 timeout = timeout,
             )
             withTimeoutOrNull(timeout) { transport.execute(request) }

@@ -6,12 +6,14 @@ route the link stands for, and gives your shared code each link exactly once.
 
 > **Status:** covered by unit tests on the JVM, Android host tests and the iOS simulator
 > (Kotlin/Native), and the Swift snippets below type-check against the generated framework.
-> Early release (0.2.x), published on Maven Central. **Not verified on a physical device** (see
+> Early release (0.4.x), published on Maven Central. **Not verified on a physical device** (see
 > the [manual test plan](./manual-test-plan.md)) and not tried inside a complete Compose
 > Multiplatform app.
 >
-> Deferred deep linking is **not supported**: a link tapped before the app is installed is not
-> restored after installation.
+> Restoring a link that was tapped before the app was installed ("deferred links") is
+> **optional and off by default**: automatic on Android through the store's install referrer;
+> on iOS there is **no automatic restore** — only a paste step, or a guess that Apple forbids.
+> None of it has run on a device. See [Deferred links](#12-deferred-links-optional).
 
 It follows the [SDK contract](./sdk-contract.md) shared by all Strybok SDKs.
 
@@ -35,12 +37,12 @@ kotlin {
     listOf(iosArm64(), iosSimulatorArm64()).forEach { target ->
         target.binaries.framework {
             baseName = "Shared"
-            export("com.strybok:strybok-kmp:0.3.0")
+            export("com.strybok:strybok-kmp:0.4.0")
         }
     }
     sourceSets {
         commonMain.dependencies {
-            api("com.strybok:strybok-kmp:0.3.0")
+            api("com.strybok:strybok-kmp:0.4.0")
         }
     }
 }
@@ -226,27 +228,34 @@ Task { try? await strybok.start() }
 
 ### API
 
-| Member               | Purpose                                                                                               |
-| -------------------- | ----------------------------------------------------------------------------------------------------- |
-| `start()`            | Suspends until the launch link was handled; later links keep arriving. Idempotent.                    |
-| `links`              | `Flow<ResolvedDeepLink>` (`url`, `linkId`, `appId`, `routePath`, `payload`, `payloadJson`).           |
-| `addListener { }`    | Callback version of `links`; returns a `Subscription` with `cancel()`.                                |
-| `getInitialLink()`   | The launch link, if not delivered through `links` / a listener yet. At most once.                     |
-| `resolve(url)`       | Resolve a URL explicitly (QR scanner, tests). Does not emit on `links` or report an app open.         |
-| `isStrybokLink(url)` | Whether a URL is one of this app's links.                                                             |
-| `handleLink(url)`    | Hand over a URL string yourself; `handleIntent` / `handleUrl` / `handleUserActivity` are built on it. |
-| `createLink(…)`      | Make a short link to a screen of the app. See [Create a link to share](#11-create-a-link-to-share).   |
-| `dispose()`          | Stop for good: nothing is delivered afterwards, collectors complete.                                  |
+| Member                   | Purpose                                                                                                                                       |
+| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `start()`                | Suspends until the launch link was handled; later links keep arriving. Idempotent.                                                            |
+| `links`                  | `Flow<ResolvedDeepLink>` (`url`, `linkId`, `appId`, `routePath`, `payload`, `payloadJson`, `campaign`, `isDeferred`, `isProbabilisticMatch`). |
+| `addListener { }`        | Callback version of `links`; returns a `Subscription` with `cancel()`.                                                                        |
+| `getInitialLink()`       | The launch link, if not delivered through `links` / a listener yet. At most once.                                                             |
+| `resolve(url)`           | Resolve a URL explicitly (QR scanner, tests). Does not emit on `links` or report an app open.                                                 |
+| `isStrybokLink(url)`     | Whether a URL is one of this app's links.                                                                                                     |
+| `handleLink(url)`        | Hand over a URL string yourself; `handleIntent` / `handleUrl` / `handleUserActivity` are built on it.                                         |
+| `createLink(…)`          | Make a short link to a screen of the app. See [Create a link to share](#11-create-a-link-to-share).                                           |
+| `enableDeferredLinks()`  | Switch deferred links on later, for example after a consent screen. See [Deferred links](#12-deferred-links-optional).                        |
+| `deferredLinkStatus`     | `StateFlow<DeferredLinkStatus>`: where the deferred-link check stands. Also `addDeferredLinkStatusListener { }`.                              |
+| `redeemPastedLink(text)` | iOS: hand over a string the person pasted; answers with a `PastedLinkResult`. Also `pasteboardMayContainLink()` and `skipPastedLink()`.       |
+| `dispose()`              | Stop for good: nothing is delivered afterwards, collectors complete.                                                                          |
 
 Options (Kotlin named arguments): `timeout` (5 s per attempt), `maxRetries` (2; only timeouts,
 network errors and 5xx are retried), `retryDelay` (400 ms, doubles per retry), `dedupeWindow`
 (2 s), `reportAppOpens` (`true`), `onError`, `clientKey` (only for `createLink`), `attestation`
 and `integrityTokenProvider` (only for `createLink`, see
-[Extra protection](#extra-protection)), plus `linkSource`, `transport` and `coroutineContext` for
-tests and custom setups. Swift sees three short constructors with all defaults,
-`Strybok(apiBaseUrl:allowedHosts:onError:)`, `Strybok(apiBaseUrl:allowedHosts:clientKey:onError:)`
-and `Strybok(apiBaseUrl:allowedHosts:clientKey:attestation:onError:)`; configure anything else in
-Kotlin.
+[Extra protection](#extra-protection)), `deferredLinks`, `installReferrerSources`,
+`allowProbabilisticMatching` and `platformContext` (see
+[Deferred links](#12-deferred-links-optional)), plus `linkSource`, `transport` and
+`coroutineContext` for tests and custom setups. Swift sees four short constructors with all
+defaults, `Strybok(apiBaseUrl:allowedHosts:onError:)`,
+`Strybok(apiBaseUrl:allowedHosts:clientKey:onError:)`,
+`Strybok(apiBaseUrl:allowedHosts:clientKey:attestation:onError:)` and
+`Strybok(apiBaseUrl:allowedHosts:clientKey:attestation:deferredLinks:allowProbabilisticMatching:onError:)`;
+configure anything else in Kotlin.
 
 Things to know:
 
@@ -308,10 +317,49 @@ After a link is delivered (or queued) the SDK sends one best-effort `app_open` e
 (`ios`/`android`) and the SDK version — no device identifiers. It never delays navigation and
 all failures are ignored. Disable it with `reportAppOpens = false`.
 
-Only the link's host and slug are sent to `resolve`; query parameters and fragments stay on the
-device. On iOS the SDK uses an ephemeral `NSURLSession` (no cookies or cache on disk).
+Only the link's host and slug are sent to `resolve`, plus the five `utm_*` campaign parameters of
+the tapped URL when they are valid (see below); every other query parameter and the fragment
+stay on the device. On iOS the SDK uses an ephemeral `NSURLSession` (no cookies or cache on disk).
 `createLink` sends the client key and what you pass to it (route, payload, title, description,
-image URL), and only when your app calls it.
+image URL), and only when your app calls it. With `deferredLinks` switched on, the SDK also
+sends what [Deferred links](#12-deferred-links-optional) lists: on Android the code found in
+the store's install referrer, on iOS the code of a link the person pasted — and, only with
+`allowProbabilisticMatching`, the device family and first language, from which the service
+identifies the device together with its network address.
+
+### Campaign values
+
+A resolved link has `campaign` (`LinkCampaign`): the `utm_source`, `utm_medium`, `utm_campaign`,
+`utm_term` and `utm_content` of this open as `source`, `medium`, `campaign`, `term` and
+`content`. It is never `null`; a property without a value is `null` (`nil` in Swift), and
+`campaign.isEmpty` is `true` when there is none at all.
+
+```kotlin
+strybok.links.collect { link ->
+    link.campaign.source?.let { analytics.setUserProperty("link_source", it) } // a label, nothing more
+    navigate(link.routePath)
+}
+```
+
+- **Where the values come from.** The link's defaults — set in the dashboard (link form →
+  "Campaign (optional)") or through the management API — with the `utm_*` parameters of the
+  tapped URL on top, key by key. `https://my-app.strybok.link/invite777?utm_source=instagram`
+  opens with source `instagram` whatever the default is; a link tapped without parameters gives
+  the defaults. A URL can replace a default but cannot clear it.
+- **Untrusted labels.** Whoever shares a link can write any `utm_*` value into its URL. Use the
+  values as labels for your own analytics; never decide access, prices, rewards or navigation by
+  them.
+- **What is accepted.** Only these five lower-case names, and only values of 1–64 characters
+  out of `A–Z a–z 0–9 . _ ~ -`. Anything else (`spring sale`, an e-mail address, non-Latin
+  letters) is dropped silently, as if the parameter were absent — by the SDK and again by the
+  server.
+- **What is sent.** With the resolve request the SDK sends those five parameters when they are
+  valid, and nothing else of the query and never the fragment. With the `app_open` event it
+  reports the values exactly as resolve returned them. The dashboard's link analytics then
+  shows a "Campaigns" breakdown by source, medium and campaign, with app opens and browser opens
+  counted separately (term and content are not broken down).
+- **Versions.** New in 0.4.0. Older versions send no query: their links carry no `campaign` and
+  their app opens are counted under the link's defaults.
 
 ## 10. Testing your integration
 
@@ -569,6 +617,248 @@ request must be a **standard** request with the given `requestHash`.
   unverified (the simulator only confirms that App Attest reports "not supported" there). Treat
   **Required** as experimental until you have seen your own released builds pass.
 
+## 12. Deferred links (optional)
+
+A person without your app taps a link, installs the app and opens it. "Deferred links" is
+what happens next. It is **off by default** — in the dashboard and in the SDK — and it is very
+different on the two platforms:
+
+| Platform | What the SDK can do                                                                                                                                        |
+| -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Android  | Automatic, through the store's install referrer: the link arrives about a second after the first start.                                                    |
+| iOS      | **Nothing automatic that Apple allows.** Two opt-in flows with real costs: the person pastes the link (A), or the service guesses (B, forbidden by Apple). |
+| JVM      | Nothing; the options are ignored.                                                                                                                          |
+
+The exact behaviour is in the SDK contract:
+[Android](./sdk-contract.md#deferred-links-optional-android),
+[iOS](./sdk-contract.md#deferred-links-on-ios-optional).
+
+> **Nothing here has run on a device, against a real store or with a real pasteboard.** The
+> flows are common code, covered by unit tests on the JVM, Android host and the iOS simulator
+> with fake sources, a fake store and a fake service. On Android the Google Play source is
+> written from Google's documentation, and **the Samsung Galaxy Store and Huawei AppGallery
+> sources are unverified**. The Swift snippets in this section were written from the Kotlin
+> signatures and have **not** been compiled.
+
+A deferred link is delivered through `links` like any other, with `isDeferred == true`. It is
+never the launch link: `start()`, `getInitialLink()` and `createLink` never wait for it and
+`getInitialLink()` never returns it. No `app_open` event is sent for it, and nothing about
+deferred links is ever reported to `onError`.
+
+### Android
+
+What the service does for this, where the code is added to your store URLs and everything it
+cannot do is in the
+[Android setup guide](./android.md#links-tapped-before-the-app-is-installed-deferred-links).
+
+1. Dashboard → your application → **When a link opens in a browser** → switch on **Restore the
+   link after install (Android only)**. The Android package name must be set.
+2. In the **Android app module**, add the library of each store you publish in. The SDK
+   compiles against them but does not bring them along:
+
+   | Source                             | Store                | Add to the app                                                                                                      | Standing                                                                                                                                                                                      |
+   | ---------------------------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+   | `PlayInstallReferrerSource`        | Google Play          | `implementation("com.android.installreferrer:installreferrer:2.2")`                                                 | Written from Google's documentation. Not device-tested                                                                                                                                        |
+   | `GalaxyStoreInstallReferrerSource` | Samsung Galaxy Store | `implementation("store.galaxy.samsung.installreferrer:samsung_galaxystore_install_referrer:4.0.0")` (Maven Central) | **Unverified.** Written from the classes of Samsung's library; Galaxy Store 4.5.20.1 or later. Whether the referrer of an `https` store link reaches the app is known from third parties only |
+   | `AppGalleryInstallReferrerSource`  | Huawei AppGallery    | No library. Possibly the two manifest entries below — **unverified**                                                | **Unverified.** Written from Huawei's AppGallery Connect pages; AppGallery 10.5.0.300 or later. Huawei asks for the user's consent first                                                      |
+
+   A source whose library is missing answers "unavailable" and the next one is asked.
+
+3. Give the SDK the application `Context` and the sources. Both exist only on Android, so pass
+   them into your shared code from the Android side:
+
+```kotlin
+// shared/src/commonMain/kotlin/AppLinks.kt
+import com.strybok.kmp.InstallReferrerSource
+import com.strybok.kmp.PlatformContext
+import com.strybok.kmp.Strybok
+
+object AppLinks {
+    lateinit var strybok: Strybok
+        private set
+
+    /** Android passes its context and sources; iOS calls `create()` with the defaults. */
+    fun create(platformContext: PlatformContext? = null, sources: List<InstallReferrerSource> = emptyList()) {
+        strybok = Strybok(
+            apiBaseUrl = "https://api.strybok.com",
+            allowedHosts = setOf("my-app.strybok.link"),
+            deferredLinks = true,
+            installReferrerSources = sources,
+            platformContext = platformContext,
+        )
+    }
+}
+```
+
+```kotlin
+// androidApp: Application.onCreate
+AppLinks.create(
+    platformContext = applicationContext,
+    sources = listOf(
+        PlayInstallReferrerSource(applicationContext),
+        GalaxyStoreInstallReferrerSource(applicationContext),
+        AppGalleryInstallReferrerSource(applicationContext),
+    ),
+)
+```
+
+`PlatformContext` **is** `android.content.Context` on Android; on iOS and the JVM it cannot be
+created and stays `null`. On Android, `deferredLinks = true` without a context is refused with
+an `IllegalArgumentException`.
+
+What happens: after `start()` has done everything else, and at most once per process, the SDK
+asks the sources in order. When a referrer carries a code (`strybok_click=dc_…`), the SDK sends
+that code, the package name and the SDK version to `POST /v1/public/deferred-links/redeem` —
+nothing about the device and nothing else from the referrer — and delivers the link it gets
+back. The referrer and the code are never logged or stored.
+
+- If a normal link of your app arrives first — the launch link, or one tapped while the check
+  is running — the normal link wins and the deferred one is dropped.
+- The SDK keeps two values in the app's private no-backup storage: how many launches tried,
+  and whether the check is finished. A launch that cannot finish leaves the check for the next
+  launch; after **three** launches it gives up. A launch that crashes during the check has used
+  one of the three. A link is delivered **at most once**.
+- An app that was **updated** since it was installed is never asked.
+- A source may take 10 seconds; after that it is abandoned for this launch.
+
+**Huawei AppGallery: manifest entries that may be needed.** Huawei's page does not say whether
+an app that targets Android 11 or later must declare that it wants to see AppGallery's content
+provider, or hold a permission to read it, and this has not been tried. The SDK adds
+**nothing** to your manifest. If `AppGalleryInstallReferrerSource` answers "unavailable" on a
+device that has AppGallery, try:
+
+```xml
+<manifest>
+    <queries>
+        <provider android:authorities="com.huawei.appmarket.commondata" />
+    </queries>
+    <uses-permission android:name="com.huawei.appmarket.service.commondata.permission.GET_COMMON_DATA" />
+</manifest>
+```
+
+**Another store, or your own code.** `InstallReferrerSource` is a one-function interface:
+`installReferrer()` is a `suspend` function called away from the main thread that returns
+`InstallReferrerResult.Referrer(string)`, `InstallReferrerResult.UnavailableForNow` (try again
+in a later launch) or `InstallReferrerResult.Unavailable` (asking again is pointless). It must
+not throw and must close what it opened, also when it is cancelled.
+
+**The limits on Android, plainly:**
+
+- It works **only when the app is installed from the store page the link sent the person to**
+  (the store _app_, not the store's website, not after a search, not from an APK), **within 24
+  hours** of the tap, **once**.
+- **Huawei AppGallery and Samsung Galaxy Store have never been verified**, not even that the
+  stores pass the value on.
+- **None of it has run on a device.** The calls into Google's and Samsung's libraries compile
+  against them and are otherwise untested.
+
+### iOS
+
+The App Store passes nothing from a link to a newly installed app, so **there is no automatic
+deferred link on iOS that Apple allows**. `deferredLinks = true` does nothing by itself there.
+Read the [iOS guide](./ios.md#links-tapped-before-the-app-is-installed) first: it recommends
+Apple's own mechanisms before either of the two flows below, and lists what each flow costs
+your users and you.
+
+**Flow A — the person pastes the link** (dashboard option **Copy and paste the link**). Before
+the App Store, iOS visitors see a page with a **Copy link and get the app** button. In your
+app, on the first screen or in onboarding, you show a paste button and hand what the person
+pasted to the SDK:
+
+```swift
+// SwiftUI, iOS 16 or later. The system paste button is the person's consent: no alert appears.
+PasteButton(payloadType: String.self) { strings in
+    guard let text = strings.first else { return }
+    Task {
+        let result = try? await strybok.redeemPastedLink(text: text)
+        if result == .notOurs { /* say that there was nothing to continue with */ }
+    }
+}
+```
+
+`redeemPastedLink` answers with one of:
+
+| Result            | Meaning                                                                                                         |
+| ----------------- | --------------------------------------------------------------------------------------------------------------- |
+| `DELIVERED`       | The link was delivered through `links`, also when a normal link was delivered earlier in this launch.           |
+| `NOT_OURS`        | The text is not a copied link of your app. No request was made; the text is dropped, not stored and not logged. |
+| `NOT_FOUND`       | The service refused the link: unknown, older than 24 hours, already used, or another app's.                     |
+| `ALREADY_HANDLED` | A deferred link was already handled on this installation. No request was made.                                  |
+| `DISABLED`        | `deferredLinks` is off (or this is not iOS). No request was made.                                               |
+| `FAILED`          | No usable answer. After a network failure the person can tap Paste again.                                       |
+
+- **The SDK never reads the pasteboard.** It receives the string from your paste button, sends
+  only the code found in it, your bundle identifier and the SDK version to
+  `POST /v1/public/deferred-links/redeem`, and drops the string.
+- `pasteboardMayContainLink()` tells you whether showing the button is worth it. It uses
+  `UIPasteboard.detectPatterns`, which answers "this looks like a web URL" without handing over
+  the content and without a banner or alert; it cannot know whether the URL is yours.
+- Place the button where a sentence can say what it does, describe it in your App Review notes,
+  and do not paste automatically.
+- What it costs: **every** iOS visitor without the app gets one extra page and tap before the
+  App Store; it works only if the person taps copy there and Paste in your app; it replaces
+  what was on their clipboard; the code works once, for 24 hours.
+
+**Flow B — probabilistic matching: forbidden by Apple, not recommended.** With
+`allowProbabilisticMatching = true` **in addition to** `deferredLinks = true` (and the owner's
+switch in the dashboard, and each link allowed individually), the SDK asks the service on the
+first launch to **guess** which link the person tapped. It sends the bundle identifier, the
+device family (`iphone`, `ipad` or `ipod`), the first preferred language and the SDK version —
+no identifier, no device model or name, no screen size, no OS version, no time zone — and the
+service uses the network address of the connection.
+
+- **This is fingerprinting in Apple's terms.** The App Store Review Guidelines and the Apple
+  Developer Program License Agreement forbid deriving data from a device to identify it, with
+  or without the user's consent. If you switch this on, the App Review and legal risk is yours.
+- **A match is a guess and can be another person's link** (shared Wi-Fi, an office, carrier
+  NAT). Every link has `isProbabilisticMatch`; **check it**, and never let such a link by
+  itself sign anyone in, accept an invitation, apply a personal discount or show personal
+  content.
+- It often cannot work at all (iCloud Private Relay, a VPN, a change of network), it makes
+  Strybok process your visitors' IP addresses, and nobody knows how accurate it is. The
+  [iOS guide](./ios.md#option-not-recommended-probabilistic-matching-iosdeferredmatching) has
+  all of it.
+- When the pasteboard may hold a link, the SDK does not guess yet: the status is
+  `AWAITING_PASTE` until your app calls `redeemPastedLink` (a result of `NOT_OURS` then lets
+  the matching start) or `skipPastedLink()` when the person leaves the screen with the paste
+  button. A pasted link always wins over a guess.
+- A normal link of your app that arrives first wins here too, three launches are the limit as
+  on Android, and a match is used up by the request that gets it.
+
+On iOS the two stored values are files in the app's own storage
+(`Library/Application Support/com.strybok.sdk/deferred`, excluded from backups), like the App
+Attest key identifier.
+
+Swift callers have the short constructor
+`Strybok(apiBaseUrl:allowedHosts:clientKey:attestation:deferredLinks:allowProbabilisticMatching:onError:)`.
+
+### Consent, and the status
+
+Reading a store's install referrer is access to information stored on the device, and flow B
+is processing of personal data. Whether your app must ask first is for you to decide. If it
+does, leave `deferredLinks` off and call `strybok.enableDeferredLinks()` once the person agreed:
+the automatic part then runs once. Until then the SDK reads, sends and stores nothing.
+
+For development and QA, `strybok.deferredLinkStatus` is a `StateFlow<DeferredLinkStatus>`
+(`addDeferredLinkStatusListener { }` is the callback form):
+
+| Status             | Meaning                                                                                                                      |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------------------- |
+| `DISABLED`         | `deferredLinks` is off, or the target has no deferred links (JVM).                                                           |
+| `CHECKING`         | The automatic check is running in this launch (or waits for `start()`).                                                      |
+| `PENDING`          | This launch could not finish the check; a later launch tries again.                                                          |
+| `AWAITING_PASTE`   | iOS: nothing happens until the app calls `redeemPastedLink` or `skipPastedLink()`. With flow A alone this is the rest state. |
+| `NOT_FIRST_LAUNCH` | A deferred link was handled in an earlier launch, or the Android app was updated since it was installed. Final.              |
+| `UNAVAILABLE`      | Android: no source is configured or none can ever answer. iOS flow B: not an iPhone, iPad or iPod. Final.                    |
+| `NO_REFERRER`      | Android: the store returned a referrer without a code of ours — the usual result of an ordinary install. Final.              |
+| `NOT_FOUND`        | The service refused the code, or (flow B) nothing matched or more than one did. Final.                                       |
+| `SUPERSEDED`       | A normal link of your app arrived first. Final.                                                                              |
+| `DELIVERED`        | The link was handed to `links`. Final.                                                                                       |
+| `FAILED`           | Three launches could not finish the check, or the answer of the service was unusable. Final.                                 |
+
+To run the automatic check again while developing, clear the app's data (Android) or delete the
+app (iOS).
+
 ## Troubleshooting
 
 | Symptom                                                                       | Check                                                                                                                                                                                                                   |
@@ -578,7 +868,7 @@ request must be a **standard** request with the given `requestHash`.
 | Screen opens twice                                                            | Two `Strybok` instances, or you navigate from both `getInitialLink()` and your own handling of the intent/URL.                                                                                                          |
 | The old link opens again after rotating the device                            | `handleIntent(intent)` is called in `onCreate` without the `savedInstanceState == null` check.                                                                                                                          |
 | A second activity appears for a link while the app is open                    | The activity is not `singleTop` (or `singleTask`), so `onNewIntent` is not used.                                                                                                                                        |
-| `Strybok` is not visible in Swift                                             | The framework does not export the library: `export("com.strybok:strybok-kmp:0.3.0")` together with an `api(...)` dependency.                                                                                            |
+| `Strybok` is not visible in Swift                                             | The framework does not export the library: `export("com.strybok:strybok-kmp:0.4.0")` together with an `api(...)` dependency.                                                                                            |
 | Gradle: "plugin ... was not found" for the module                             | Declare both plugins with versions (`apply false`) in the root build file (step 2).                                                                                                                                     |
 | `IllegalStateException: Module with the Main dispatcher...` in JVM unit tests | Pass `coroutineContext` (a test dispatcher) as in step 10; Android's main thread does not exist in host tests.                                                                                                          |
 | Works on tap in Notes/Messages, not from Instagram/Telegram                   | In-app browsers often do not hand links to apps. Users get the fallback page with a manual button.                                                                                                                      |
