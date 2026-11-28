@@ -55,6 +55,37 @@ class StrybokIosTest {
         sdk.dispose()
     }
 
+    @Test
+    fun handleUrlTakesPathLinksAndLongLinksOnlyWithTheOption() = runTest {
+        val path = "https://$HOST/product/42?id=7&secret=x"
+        val long = "https://$HOST/?link=https%3A%2F%2Fexample.com%2Fp%3Fid%3D7&apn=com.example.app"
+
+        val without = sdk(FakeApi(), source = PushLinkSource())
+        assertFalse(without.handleUrl(NSURL(string = path)))
+        assertFalse(without.handleUrl(NSURL(string = long)))
+        without.dispose()
+
+        val api = FakeApi()
+        val sdk = sdk(api, source = PushLinkSource(), parameterLinks = ParameterLinks(listOf("id")))
+        val received = collectLinks(sdk)
+        sdk.start()
+        assertTrue(sdk.handleUrl(NSURL(string = path)))
+        val web = NSUserActivity(activityType = NSUserActivityTypeBrowsingWeb)
+        web.webpageURL = NSURL(string = long)
+        assertTrue(sdk.handleUserActivity(web))
+        advanceUntilIdle()
+
+        assertEquals(listOf(path, long), received.map { it.url })
+        assertEquals(
+            listOf(
+                resolveRequestUrl("https://$HOST/product/42?id=7"),
+                resolveRequestUrl("https://$HOST/?link=https%3A%2F%2Fexample.com%2Fp%3Fid%3D7&apn=com.example.app"),
+            ),
+            api.resolves.map { it.url },
+        )
+        sdk.dispose()
+    }
+
     /** No HTTP server is available here, so only the failure path of NSURLSession is exercised. */
     @Test
     fun theNsUrlSessionTransportReportsARefusedConnectionAsAnException() = runTest {

@@ -84,6 +84,7 @@ internal fun TestScope.sdk(
     attestor: Attestor? = null,
     wallClock: () -> Instant = { wallClockOf(this) },
     deferred: DeferredSetup = DeferredSetup(),
+    parameterLinks: ParameterLinks? = null,
 ): Strybok = Strybok(
     apiBaseUrl = apiBaseUrl,
     allowedHosts = allowedHosts,
@@ -101,6 +102,7 @@ internal fun TestScope.sdk(
     attestor = attestor,
     wallClock = wallClock,
     deferred = deferred,
+    parameterLinks = parameterLinks,
 )
 
 /** 2026-11-24T10:00:00Z, the wall-clock time at which every test starts. */

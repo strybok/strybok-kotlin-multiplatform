@@ -54,7 +54,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 
 /** Version reported with analytics events. */
-public const val STRYBOK_SDK_VERSION: String = "0.4.0"
+public const val STRYBOK_SDK_VERSION: String = "0.5.0"
 
 /** Returned by [Strybok.addListener]; call [cancel] to stop receiving links. */
 public fun interface Subscription {
@@ -105,6 +105,12 @@ public class Strybok internal constructor(
     private val wallClock: () -> Instant = { Clock.System.now() },
     /** Deferred links: off, and without a platform, unless the public constructor says otherwise. */
     deferred: DeferredSetup = DeferredSetup(),
+    /**
+     * Links without an API call (path links and Firebase long links), off when `null`: see
+     * [ParameterLinks]. Without it only single-slug links are ours and resolving sends exactly
+     * what 0.4.0 sent. Deferred links are unaffected: they are always single-slug links.
+     */
+    public val parameterLinks: ParameterLinks? = null,
 ) {
     /**
      * @param apiBaseUrl base URL of the API, e.g. `https://api.strybok.com`; a path prefix is kept.
@@ -151,8 +157,15 @@ public class Strybok internal constructor(
      *   link — see [ResolvedDeepLink.isProbabilisticMatch]. Off by default; not recommended.
      * @param platformContext Android only: the application `Context`, needed when
      *   [deferredLinks] is (or will be) switched on. `null` on iOS and the JVM.
+     * @param parameterLinks links without an API call, off by default: also deliver path links
+     *   (`https://my-app.strybok.link/product/42?id=7`) and Firebase long links
+     *   (`https://my-app.strybok.link/?link=…`), and send the values of these payload keys with
+     *   them. Copy `parameterLinks.payloadKeys` of the integration guide, e.g.
+     *   `ParameterLinks(listOf("id", "lang"))`; see [ParameterLinks]. Without it only single-slug
+     *   links are ours and resolving sends exactly what 0.4.0 sent.
      * @throws IllegalArgumentException when a value is out of range, or when [deferredLinks] is
-     *   on for Android without a [platformContext].
+     *   on for Android without a [platformContext]. ([ParameterLinks] checks its keys itself, in
+     *   the same way.)
      */
     public constructor(
         apiBaseUrl: String,
@@ -173,11 +186,13 @@ public class Strybok internal constructor(
         installReferrerSources: List<InstallReferrerSource> = emptyList(),
         allowProbabilisticMatching: Boolean = false,
         platformContext: PlatformContext? = null,
+        parameterLinks: ParameterLinks? = null,
     ) : this(
         apiBaseUrl, allowedHosts, timeout, maxRetries, retryDelay, dedupeWindow, reportAppOpens,
         onError, linkSource, transport, coroutineContext, TimeSource.Monotonic, clientKey,
         if (attestation) platformAttestor(integrityTokenProvider) else null,
         deferred = deferredSetup(deferredLinks, installReferrerSources, allowProbabilisticMatching, platformContext),
+        parameterLinks = parameterLinks,
     )
 
     /** All defaults; convenient from Swift, where Kotlin default arguments are not available. */
@@ -227,6 +242,26 @@ public class Strybok internal constructor(
         apiBaseUrl, allowedHosts, timeout = 5.seconds, onError = onError, clientKey = clientKey,
         attestation = attestation, deferredLinks = deferredLinks,
         allowProbabilisticMatching = allowProbabilisticMatching,
+    )
+
+    /**
+     * All defaults plus the switches of [createLink], of deferred links and of links without an
+     * API call ([parameterLinks]); convenient from Swift. [allowProbabilisticMatching] is
+     * forbidden by Apple's rules — read the constructor with all arguments before passing `true`.
+     */
+    public constructor(
+        apiBaseUrl: String,
+        allowedHosts: Set<String>,
+        clientKey: String?,
+        attestation: Boolean,
+        deferredLinks: Boolean,
+        allowProbabilisticMatching: Boolean,
+        parameterLinks: ParameterLinks?,
+        onError: ((StrybokException) -> Unit)?,
+    ) : this(
+        apiBaseUrl, allowedHosts, timeout = 5.seconds, onError = onError, clientKey = clientKey,
+        attestation = attestation, deferredLinks = deferredLinks,
+        allowProbabilisticMatching = allowProbabilisticMatching, parameterLinks = parameterLinks,
     )
 
     init {
@@ -370,9 +405,10 @@ public class Strybok internal constructor(
 
     /**
      * Whether [url] is a Strybok link of this app: `https`, a host from [allowedHosts], no
-     * credentials, default port and a single slug path.
+     * credentials, default port and a single slug path — or, with [parameterLinks], a route path
+     * or a Firebase long link.
      */
-    public fun isStrybokLink(url: String): Boolean = parseLinkUrl(url, allowedHosts) != null
+    public fun isStrybokLink(url: String): Boolean = parseLinkUrl(url, allowedHosts, parameterLinks) != null
 
     /**
      * Hands a URL received from the OS to the SDK. The platform glue (`handleIntent` on
@@ -403,12 +439,12 @@ public class Strybok internal constructor(
     @Throws(StrybokException::class, IllegalStateException::class, CancellationException::class)
     public suspend fun resolve(url: String): ResolvedDeepLink {
         checkNotDisposed()
-        val link = parseLinkUrl(url, allowedHosts)
+        val link = parseLinkUrl(url, allowedHosts, parameterLinks)
             ?: throw UnsupportedLinkException("Not a link for this app", url)
         val request = HttpRequest(
             method = "GET",
-            // Of the query only the campaign parameters are sent; the rest and the fragment
-            // may hold private data.
+            // Of the query only the campaign parameters (and the configured payload keys) are
+            // sent; the rest and the fragment may hold private data.
             url = "$apiBaseUrl/v1/public/resolve?url=${percentEncode(link.lookup)}",
             headers = mapOf("Accept" to "application/json"),
             body = null,

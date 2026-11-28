@@ -113,6 +113,7 @@ internal fun TestScope.launchApp(
     errors: MutableList<StrybokException>? = null,
     maxRetries: Int = 2,
     sourceTimeout: Duration = 10.seconds,
+    parameterLinks: ParameterLinks? = null,
 ): Strybok = sdk(
     api,
     source = linkSource,
@@ -126,4 +127,5 @@ internal fun TestScope.launchApp(
         background = StandardTestDispatcher(testScheduler),
         sourceTimeout = sourceTimeout,
     ),
+    parameterLinks = parameterLinks,
 )

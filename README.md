@@ -40,6 +40,30 @@ parameters of the tapped URL. They are labels chosen by whoever shared the link:
 your analytics, never to decide anything. Details:
 [integration guide](./docs/kotlin-multiplatform.md#campaign-values).
 
+### Links without an API call (optional)
+
+From 0.5.0, off by default. When the owner switches them on in the dashboard, path links
+(`https://my-app.strybok.link/product/42?id=7`) and Firebase long links
+(`https://my-app.strybok.link/?link=…`) open the app without a link being created first. Pass the
+payload keys of your application — `parameterLinks.payloadKeys` of the integration guide
+(`GET /v1/apps/:appId/integration`, shown on the dashboard's setup screen):
+
+```kotlin
+val strybok = Strybok(
+    apiBaseUrl = "https://api.strybok.com",
+    allowedHosts = setOf("my-app.strybok.link"),
+    parameterLinks = ParameterLinks(listOf("id", "lang")),
+)
+```
+
+The link arrives on `links` like any other; its `routePath` and `payload` are what the service
+read, never the tapped path. Of the tapped URL only the path, the first value of each of these
+keys and the `utm_*` values are sent (for a long link: the deep link's scheme, host and path with
+its values of these keys, plus `apn` and `ibi`). Without the option the SDK sends exactly what
+0.4.0 sent; deferred links always keep the single-slug rule. Invalid keys make `ParameterLinks`
+throw `IllegalArgumentException`. **Unit-tested only, never run on a device.** Details:
+[integration guide](./docs/kotlin-multiplatform.md#links-without-an-api-call).
+
 ### Extra protection (optional)
 
 The publishable key can be copied out of an app. The owner of the application can therefore ask
@@ -153,7 +177,7 @@ Behaviour shared by all SDKs: [`docs/sdk-contract.md`](./docs/sdk-contract.md).
   justify shipping Ktor and an engine per platform into every app. Google's Play Integrity
   library and the stores' install referrer libraries are not dependencies; only Android apps
   that switch attestation or deferred links on add them.
-- **Early release (0.4.x)**: covered by unit tests on the JVM, Android host tests and the iOS simulator. **Not verified on
+- **Early release (0.5.x)**: covered by unit tests on the JVM, Android host tests and the iOS simulator. **Not verified on
   a physical device.**
 - Restoring a link after installation ("deferred links") is optional and off by default:
   automatic on Android, and on iOS only a paste step or a guess that Apple forbids — there is no
@@ -167,7 +191,7 @@ The library is on Maven Central. In your shared module:
 kotlin {
     sourceSets {
         commonMain.dependencies {
-            api("com.strybok:strybok-kmp:0.4.0")
+            api("com.strybok:strybok-kmp:0.5.0")
         }
     }
 }

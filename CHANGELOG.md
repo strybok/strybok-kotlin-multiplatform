@@ -1,3 +1,37 @@
+## 0.5.0
+
+- Links without an API call, optional and off by default: the new constructor argument (and
+  property) `parameterLinks` (`ParameterLinks(payloadKeys)`) delivers path links
+  (`https://<host>/product/42?id=7`) and Firebase long links (`https://<host>/?link=…&apn=…&ibi=…`)
+  as well. Take the keys from `parameterLinks.payloadKeys` of the integration guide
+  (`GET /v1/apps/:appId/integration`). Swift gets
+  `Strybok(apiBaseUrl:allowedHosts:clientKey:attestation:deferredLinks:allowProbabilisticMatching:parameterLinks:onError:)`.
+- With the option a URL of an allowed host is also ours when its path is a route path (checked
+  as received: never decoded or normalised; no `//`, no dot segments, nothing reserved such as
+  `/.well-known/…` or `/favicon.ico`), or `/` (also an empty path) with a `link` parameter that
+  is an `http(s)` deep link. Resolving then also sends the first value of each configured key
+  (1–256 UTF-16 code units without control characters, re-encoded strictly), and for a long link
+  the deep link rebuilt from its scheme, host and path with its own values of those keys, plus
+  `apn` and `ibi`. Nothing else of the query and never the fragment. The rules are common code,
+  identical on Android, iOS and the JVM, including a strict UTF-8 decoder of their own.
+- The delivered link's `routePath` and `payload` are the service's answer, never the tapped URL;
+  `app_open` carries the `linkId` the service returned. `isStrybokLink`, `handleLink` (and so
+  `handleIntent`, `handleUrl`, `handleUserActivity`) and `resolve` follow the option.
+- `ParameterLinks` throws `IllegalArgumentException`, like an invalid `apiBaseUrl`, for more than
+  20 keys, a key twice, a key that is not 1–40 characters of `A–Z a–z 0–9 _ . -`, a `utm_…` key,
+  or `st`, `sd`, `si`, `strybok_click`. The keys of the integration guide always pass.
+- Without the option every resolve request is exactly what 0.4.0 sent. Deferred links keep the
+  single-slug rule with or without it: the pasted text of `redeemPastedLink`, and the `url` of a
+  redeem answer (Android referrer and iOS pasted link) or a match answer.
+- The common tests run every case of the shared test vectors of the SDK contract (each lookup
+  through `resolve` and through `handleLink` and `start`, each configuration through
+  `ParameterLinks`) on the JVM, the Android host and the iOS simulator. The build turns the
+  byte-identical copy in `src/commonTest/resources` into a Kotlin constant
+  (`generateParameterLinkVectors`), because Kotlin/Native test binaries have no resources; a JVM
+  test checks that the constant is the file unchanged.
+- **Unit-tested only (JVM, Android host, iOS simulator), never run on a device** or against the
+  production API.
+
 ## 0.4.0
 
 - Campaign values. `ResolvedDeepLink.campaign` (`LinkCampaign`: `source`, `medium`, `campaign`,

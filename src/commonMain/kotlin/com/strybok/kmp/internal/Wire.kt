@@ -61,7 +61,9 @@ internal fun parseDeferredResponse(body: String, allowedHosts: Set<String>, prob
     if (deferred != true) return null
     if (probabilistic && json.string("matched") != "probabilistic") return null
     val url = json.string("url") ?: return null
-    // An answer that points anywhere but at a link of this app is dropped.
+    // An answer that points anywhere but at a link of this app is dropped. The service offers
+    // deferred links for stored links only, so `url` must have a single slug path even with the
+    // `parameterLinks` option.
     if (parseLinkUrl(url, allowedHosts) == null) return null
     return parseResolveResponse(url, body, isDeferred = true, isProbabilisticMatch = probabilistic)
 }

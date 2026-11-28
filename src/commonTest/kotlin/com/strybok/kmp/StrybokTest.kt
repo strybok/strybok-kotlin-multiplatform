@@ -258,7 +258,7 @@ class StrybokTest {
             assertEquals(API, sdk.apiBaseUrl)
             sdk.dispose()
         }
-        assertEquals("0.4.0", STRYBOK_SDK_VERSION)
+        assertEquals("0.5.0", STRYBOK_SDK_VERSION)
     }
 
     // --- cold start ------------------------------------------------------------------------
@@ -637,7 +637,7 @@ class StrybokTest {
         assertEquals(setOf("eventId", "linkId", "type", "platform", "sdkVersion"), event.keys)
         assertEquals("app_open", event.getValue("type").jsonPrimitive.content)
         assertEquals("link_1", event.getValue("linkId").jsonPrimitive.content)
-        assertEquals("0.4.0", event.getValue("sdkVersion").jsonPrimitive.content)
+        assertEquals("0.5.0", event.getValue("sdkVersion").jsonPrimitive.content)
         assertTrue(event.getValue("platform").jsonPrimitive.content in setOf("ios", "android", "unknown"))
         assertEquals(EXPECTED_PLATFORM, event.getValue("platform").jsonPrimitive.content)
         val eventId = event.getValue("eventId").jsonPrimitive.content

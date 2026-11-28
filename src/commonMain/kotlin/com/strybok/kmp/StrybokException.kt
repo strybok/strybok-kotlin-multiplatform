@@ -13,7 +13,8 @@ public sealed class StrybokException(
 
 /**
  * The URL is not a Strybok link of this app: not `https`, a host outside `allowedHosts`,
- * credentials or a non-default port, or a path that is not a single slug.
+ * credentials or a non-default port, or a path that is not a single slug (with the
+ * `parameterLinks` option: nor a route path or a Firebase long link).
  */
 public class UnsupportedLinkException(message: String, url: String?) : StrybokException(message, url)
 

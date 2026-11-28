@@ -6,7 +6,7 @@ route the link stands for, and gives your shared code each link exactly once.
 
 > **Status:** covered by unit tests on the JVM, Android host tests and the iOS simulator
 > (Kotlin/Native), and the Swift snippets below type-check against the generated framework.
-> Early release (0.4.x), published on Maven Central. **Not verified on a physical device** (see
+> Early release (0.5.x), published on Maven Central. **Not verified on a physical device** (see
 > the [manual test plan](./manual-test-plan.md)) and not tried inside a complete Compose
 > Multiplatform app.
 >
@@ -22,6 +22,7 @@ It follows the [SDK contract](./sdk-contract.md) shared by all Strybok SDKs.
 1. Create an application in Strybok with your iOS and Android identifiers.
 2. Read its setup data: `GET /v1/apps/:appId/integration` returns the managed hostname
    (for example `my-app.strybok.link`) and ready-to-copy snippets.
+   If the application has an active [custom domain](./ios.md#custom-domain-optional), the same answer lists it in `allowedHosts`: declare it in the entitlement and the intent filter next to the managed hostname and pass both to `allowedHosts`.
 3. Complete the native setup: [Android](./android.md) (intent filter with
    `android:autoVerify="true"`) and [iOS](./ios.md) (Associated Domains). Without it the OS
    never opens the app for a link, and the SDK has nothing to receive. The Flutter-only steps
@@ -37,12 +38,12 @@ kotlin {
     listOf(iosArm64(), iosSimulatorArm64()).forEach { target ->
         target.binaries.framework {
             baseName = "Shared"
-            export("com.strybok:strybok-kmp:0.4.0")
+            export("com.strybok:strybok-kmp:0.5.0")
         }
     }
     sourceSets {
         commonMain.dependencies {
-            api("com.strybok:strybok-kmp:0.4.0")
+            api("com.strybok:strybok-kmp:0.5.0")
         }
     }
 }
@@ -84,6 +85,50 @@ object AppLinks {
 
 Do not create it per screen or per Activity, and do not `dispose()` it when an Activity is
 destroyed: a disposed instance cannot be reused.
+
+### Links without an API call
+
+_New in 0.5.0, optional. Covered by unit tests only (JVM, Android host, iOS simulator); never run
+on a device._
+
+When the owner switches them on in the dashboard, any address of your link hosts can open a screen
+of your app without a link being created first: **path links** such as
+`https://my-app.strybok.link/product/42?id=7`, and **Firebase long links**
+`https://my-app.strybok.link/?link=…&apn=…&ibi=…`. Without the `parameterLinks` option the SDK
+ignores such URLs, exactly like 0.4.0. To deliver them, pass your application's payload keys:
+
+```kotlin
+val strybok = Strybok(
+    apiBaseUrl = "https://api.strybok.com",
+    allowedHosts = setOf("my-app.strybok.link"),
+    // parameterLinks.payloadKeys of GET /v1/apps/:appId/integration
+    parameterLinks = ParameterLinks(listOf("id", "lang")),
+)
+```
+
+- **Where the keys come from:** `parameterLinks` of the integration guide
+  (`GET /v1/apps/:appId/integration`, shown on the dashboard's setup screen next to
+  `allowedHosts`). It is `null` while both kinds are off; then leave the option out. The keys are
+  compiled into the app: a key the owner adds later reaches users with your next release.
+- **Invalid keys** — more than 20, a key twice, anything but 1–40 characters of
+  `A–Z a–z 0–9 _ . -`, a `utm_…` key, or `st`, `sd`, `si`, `strybok_click` — make
+  `ParameterLinks(…)` throw `IllegalArgumentException`, like an invalid `apiBaseUrl`. The keys of
+  the integration guide always pass.
+- **What you get:** a link like any other, on `links` or your listener, with an `app_open` event.
+  `routePath` and `payload` are what the service read and allowed, never the tapped path or query;
+  `url` is the URL as tapped.
+- **What is sent:** the path as received, the first value of each of your keys and the five
+  `utm_*` values; for a long link the deep link's scheme, host and path with its values of your
+  keys, and `apn` and `ibi`. Nothing else of the query and never the fragment, so do not configure
+  keys that carry personal data.
+- **Noise:** with the option any address of your hosts that looks like a route is resolved, so
+  `onError` receives `LinkNotFoundException` for one that is no link (a typo, a route that is not
+  allowed).
+- **Deferred links are unchanged:** a pasted link and a restored link always have a single slug.
+- **Swift:** `Strybok(apiBaseUrl:allowedHosts:clientKey:attestation:deferredLinks:allowProbabilisticMatching:parameterLinks:onError:)`
+  with `ParameterLinks(payloadKeys: ["id", "lang"])`.
+
+The exact rules are in the [SDK contract](./sdk-contract.md#links-without-an-api-call).
 
 ## 4. Forward links on Android
 
@@ -249,12 +294,15 @@ network errors and 5xx are retried), `retryDelay` (400 ms, doubles per retry), `
 and `integrityTokenProvider` (only for `createLink`, see
 [Extra protection](#extra-protection)), `deferredLinks`, `installReferrerSources`,
 `allowProbabilisticMatching` and `platformContext` (see
-[Deferred links](#12-deferred-links-optional)), plus `linkSource`, `transport` and
-`coroutineContext` for tests and custom setups. Swift sees four short constructors with all
+[Deferred links](#12-deferred-links-optional)), `parameterLinks` (see
+[Links without an API call](#links-without-an-api-call)), plus `linkSource`, `transport` and
+`coroutineContext` for tests and custom setups. Swift sees five short constructors with all
 defaults, `Strybok(apiBaseUrl:allowedHosts:onError:)`,
 `Strybok(apiBaseUrl:allowedHosts:clientKey:onError:)`,
-`Strybok(apiBaseUrl:allowedHosts:clientKey:attestation:onError:)` and
-`Strybok(apiBaseUrl:allowedHosts:clientKey:attestation:deferredLinks:allowProbabilisticMatching:onError:)`;
+`Strybok(apiBaseUrl:allowedHosts:clientKey:attestation:onError:)`,
+`Strybok(apiBaseUrl:allowedHosts:clientKey:attestation:deferredLinks:allowProbabilisticMatching:onError:)`
+and
+`Strybok(apiBaseUrl:allowedHosts:clientKey:attestation:deferredLinks:allowProbabilisticMatching:parameterLinks:onError:)`;
 configure anything else in Kotlin.
 
 Things to know:
@@ -295,6 +343,9 @@ onError = { error ->
 }
 ```
 
+With `parameterLinks` a route path or a Firebase long link is not an `UnsupportedLinkException`
+either (see [Links without an API call](#links-without-an-api-call)).
+
 In Swift a thrown error arrives as `NSError`; the Kotlin exception is
 `(error as NSError).kotlinException as? StrybokException`. Using the SDK after `dispose()`
 throws `IllegalStateException`.
@@ -318,10 +369,12 @@ After a link is delivered (or queued) the SDK sends one best-effort `app_open` e
 all failures are ignored. Disable it with `reportAppOpens = false`.
 
 Only the link's host and slug are sent to `resolve`, plus the five `utm_*` campaign parameters of
-the tapped URL when they are valid (see below); every other query parameter and the fragment
-stay on the device. On iOS the SDK uses an ephemeral `NSURLSession` (no cookies or cache on disk).
-`createLink` sends the client key and what you pass to it (route, payload, title, description,
-image URL), and only when your app calls it. With `deferredLinks` switched on, the SDK also
+the tapped URL when they are valid (see below) — with `parameterLinks` also the path of a path
+link and the values of your payload keys, or for a long link the parts listed in
+[Links without an API call](#links-without-an-api-call); every other query parameter and the
+fragment stay on the device. On iOS the SDK uses an ephemeral `NSURLSession` (no cookies or cache
+on disk). `createLink` sends the client key and what you pass to it (route, payload, title,
+description, image URL), and only when your app calls it. With `deferredLinks` switched on, the SDK also
 sends what [Deferred links](#12-deferred-links-optional) lists: on Android the code found in
 the store's install referrer, on iOS the code of a link the person pasted — and, only with
 `allowProbabilisticMatching`, the device family and first language, from which the service
@@ -868,7 +921,7 @@ app (iOS).
 | Screen opens twice                                                            | Two `Strybok` instances, or you navigate from both `getInitialLink()` and your own handling of the intent/URL.                                                                                                          |
 | The old link opens again after rotating the device                            | `handleIntent(intent)` is called in `onCreate` without the `savedInstanceState == null` check.                                                                                                                          |
 | A second activity appears for a link while the app is open                    | The activity is not `singleTop` (or `singleTask`), so `onNewIntent` is not used.                                                                                                                                        |
-| `Strybok` is not visible in Swift                                             | The framework does not export the library: `export("com.strybok:strybok-kmp:0.4.0")` together with an `api(...)` dependency.                                                                                            |
+| `Strybok` is not visible in Swift                                             | The framework does not export the library: `export("com.strybok:strybok-kmp:0.5.0")` together with an `api(...)` dependency.                                                                                            |
 | Gradle: "plugin ... was not found" for the module                             | Declare both plugins with versions (`apply false`) in the root build file (step 2).                                                                                                                                     |
 | `IllegalStateException: Module with the Main dispatcher...` in JVM unit tests | Pass `coroutineContext` (a test dispatcher) as in step 10; Android's main thread does not exist in host tests.                                                                                                          |
 | Works on tap in Notes/Messages, not from Instagram/Telegram                   | In-app browsers often do not hand links to apps. Users get the fallback page with a manual button.                                                                                                                      |

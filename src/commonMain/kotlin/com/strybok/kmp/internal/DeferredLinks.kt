@@ -545,6 +545,7 @@ private fun hexDigit(byte: Byte): Int = when (val char = byte.toInt().toChar()) 
  * The click id of a link the person copied on the page before the App Store (SDK contract,
  * "Flow A"): [text], trimmed, must be a link of this app whose first `strybok_click` parameter
  * is a click id. `null` for anything else — the person may have had anything on their clipboard.
+ * Only stored links are offered for pasting, so the slug rule applies even with `parameterLinks`.
  */
 internal fun pastedClickId(text: String, allowedHosts: Set<String>): String? {
     val link = parseLinkUrl(text.trim(), allowedHosts) ?: return null

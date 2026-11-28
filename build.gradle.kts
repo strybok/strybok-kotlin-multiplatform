@@ -8,10 +8,55 @@ plugins {
 }
 
 group = "com.strybok"
-version = "0.4.0"
+version = "0.5.0"
 
 val coroutinesVersion = "1.10.2"
 val serializationVersion = "1.9.0"
+
+// The shared test vectors of the SDK contract (the byte-identical copy in
+// src/commonTest/resources) as a Kotlin constant of the common tests: Kotlin/Native test
+// binaries have no resources, so this is how the JVM, Android host and iOS simulator tests all
+// read the very same text.
+val generateParameterLinkVectors by tasks.registering {
+    val source = layout.projectDirectory.file("src/commonTest/resources/parameter-links-vectors.json")
+    val output = layout.buildDirectory.dir("generated/parameterLinkVectors/kotlin")
+    inputs.file(source)
+    outputs.dir(output)
+    doLast {
+        val text = source.asFile.readText(Charsets.UTF_8)
+        // Plain string literals, every character escaped where Kotlin could read it otherwise.
+        val chunks = text.chunked(4096).joinToString(",\n") { chunk ->
+            val literal = buildString {
+                for (char in chunk) {
+                    when {
+                        char == '\\' -> append("\\\\")
+                        char == '"' -> append("\\\"")
+                        char == '$' -> append("\\\$")
+                        char == '\n' -> append("\\n")
+                        char.code in 0x20..0x7E -> append(char)
+                        else -> append("\\u").append(char.code.toString(16).padStart(4, '0'))
+                    }
+                }
+            }
+            "    \"$literal\""
+        }
+        val file = output.get().file("com/strybok/kmp/ParameterLinkVectorsJson.kt").asFile
+        file.parentFile.mkdirs()
+        file.writeText(
+            """
+            |// Generated from src/commonTest/resources/parameter-links-vectors.json by the Gradle task
+            |// generateParameterLinkVectors. Do not edit.
+            |package com.strybok.kmp
+            |
+            |/** The text of parameter-links-vectors.json, unchanged. */
+            |internal val PARAMETER_LINK_VECTORS_JSON: String = listOf(
+            |$chunks,
+            |).joinToString("")
+            |
+            """.trimMargin(),
+        )
+    }
+}
 
 kotlin {
     explicitApi()
@@ -59,9 +104,12 @@ kotlin {
             api("org.jetbrains.kotlinx:kotlinx-coroutines-core:$coroutinesVersion")
             implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:$serializationVersion")
         }
-        commonTest.dependencies {
-            implementation(kotlin("test"))
-            implementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:$coroutinesVersion")
+        commonTest {
+            kotlin.srcDir(generateParameterLinkVectors)
+            dependencies {
+                implementation(kotlin("test"))
+                implementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:$coroutinesVersion")
+            }
         }
         androidMain.dependencies {
             // Provides Dispatchers.Main on Android.
